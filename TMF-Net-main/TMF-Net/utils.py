@@ -53,12 +53,14 @@ class MaskMSE(nn.Module):
     def __init__(self, ):
         super(MaskMSE, self).__init__()
 
-    def forward(self, pred, mask, pred_iou):
+    def forward(self, pred, mask, pred_iou=None):
         """
         pred: [B, 1, H, W]
         mask: [B, 1, H, W]
-        pred_iou: [B, 1]
+        pred_iou: [B, 1] or None
         """
+        if pred_iou is None:
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         assert pred.shape == mask.shape, "pred and mask should have the same shape."
 
         pred = torch.sigmoid(pred)
@@ -113,12 +115,12 @@ class BoundaryLoss(nn.Module):
         """
         assert pred.shape == mask.shape, "pred and mask should have the same shape."
         
-        # 确保kernel在正确的设备上
-        self.kernel = self.kernel.to(pred.device)
+        # 确保kernel在正确的设备和dtype上
+        self.kernel = self.kernel.to(device=pred.device, dtype=pred.dtype)
         
         # 计算边界
         pred_boundary = torch.abs(F.conv2d(torch.sigmoid(pred), self.kernel, padding=self.radius))
-        mask_boundary = torch.abs(F.conv2d(mask.float(), self.kernel, padding=self.radius))
+        mask_boundary = torch.abs(F.conv2d(mask.to(dtype=pred.dtype), self.kernel, padding=self.radius))
         
         # 计算边界损失
         loss = F.smooth_l1_loss(pred_boundary, mask_boundary)
@@ -159,12 +161,20 @@ class FocalDice_MSELoss(nn.Module):
         self.boundary_loss = BoundaryLoss()
         self.maskiou_mse = MaskMSE()
 
-    def forward(self, pred, mask, pred_iou):
+    def forward(self, pred, mask, pred_iou=None, **kwargs):
         """
-        pred: [B, 1, H, W]
+        pred: [B, 1, H, W] or dict containing 'masks' and 'iou_pred'
         mask: [B, 1, H, W]
+        pred_iou: optional, if pred is dict and pred_iou is None, extracted from dict
         """
+        if isinstance(pred, dict):
+            if pred_iou is None and 'iou_pred' in pred:
+                pred_iou = pred['iou_pred']
+            pred = pred['masks']
         assert pred.shape == mask.shape, "pred and mask should have the same shape."
+
+        # 统一 mask 的 dtype 与 pred 一致
+        mask = mask.to(dtype=pred.dtype)
 
         focal_loss = self.focal_loss(pred, mask)
         dice_loss = self.dice_loss(pred, mask)
@@ -172,14 +182,21 @@ class FocalDice_MSELoss(nn.Module):
         focal_tversky_loss = self.focal_tversky_loss(pred, mask)
         boundary_loss = self.boundary_loss(pred, mask)
         
-        loss1 = (self.focal_weight * focal_loss +
-                 self.dice_weight * dice_loss +
-                 self.tversky_weight * tversky_loss +
-                 self.focal_tversky_weight * focal_tversky_loss +
-                 self.boundary_weight * boundary_loss)
+        w_focal = torch.tensor(self.focal_weight, device=pred.device, dtype=pred.dtype)
+        w_dice = torch.tensor(self.dice_weight, device=pred.device, dtype=pred.dtype)
+        w_tversky = torch.tensor(self.tversky_weight, device=pred.device, dtype=pred.dtype)
+        w_focal_tversky = torch.tensor(self.focal_tversky_weight, device=pred.device, dtype=pred.dtype)
+        w_boundary = torch.tensor(self.boundary_weight, device=pred.device, dtype=pred.dtype)
+        w_mse = torch.tensor(self.mse_weight, device=pred.device, dtype=pred.dtype)
+
+        loss1 = (w_focal * focal_loss +
+                 w_dice * dice_loss +
+                 w_tversky * tversky_loss +
+                 w_focal_tversky * focal_tversky_loss +
+                 w_boundary * boundary_loss)
         loss2 = self.maskiou_mse(pred, mask, pred_iou)
-        loss = loss1 + loss2 * self.mse_weight
-        return loss
+        loss = loss1 + loss2 * w_mse
+        return loss.to(dtype=pred.dtype)
 
 
 def get_iou_and_dice(pred, label):
