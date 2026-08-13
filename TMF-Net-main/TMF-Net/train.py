@@ -7,6 +7,7 @@ import os
 import csv
 import ast
 import torch.nn.functional as F  
+
 join = os.path.join
 from tqdm import tqdm
 from torch.backends import cudnn
@@ -24,33 +25,24 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import datetime as dt
 import logging
 import gc
+
 model_logger = logging.getLogger('model')
 model_logger.setLevel(logging.DEBUG)
 from data_loader import get_loader 
 from model import IMISNet, TMFNet, TemporalAwareLoss
 from utils import FocalDice_MSELoss
 
-# 环境变量配置 - 现代 PyTorch 推荐配置
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
-
-# 开启 cudnn.benchmark 加速训练
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True
-torch.backends.cuda.matmul.allow_tf32 = False  # 关闭TF32，省显存+提精度
+torch.backends.cuda.matmul.allow_tf32 = False  
 torch.backends.cudnn.allow_tf32 = False
-# 注意：不再在此处调用 torch.cuda.empty_cache()，避免不必要的开销
-
-
-
-
-
-
 import re
 import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
 
+warnings.filterwarnings("ignore", category=UserWarning)
 parser = argparse.ArgumentParser()
 parser.add_argument('--work_dir', type=str, default='work_dir')
 parser.add_argument('--task_name', type=str, default='ACDC_traj')
@@ -59,7 +51,6 @@ parser.add_argument("--data_dir", type = str, default='dataset/ACDC')
 parser.add_argument('--image_size', type=int, default=256)
 parser.add_argument('--test_mode', type=bool, default=False)
 parser.add_argument('--batch_size', type=int, default=16)
-#load model
 parser.add_argument('--model_type', type=str, default='vit_b')
 parser.add_argument('--sam_checkpoint', type=str, default='ckpt/IMISNet-B.pth')
 parser.add_argument('--pretrain_path', type=str, default='work_dir/ACDC_traj/IMIS_latest.pth')
@@ -71,7 +62,6 @@ parser.add_argument('--use_temporal_fusion', action='store_true', default=True, 
 parser.add_argument('--temporal_interactions', type=int, default=3, help='Number of interaction rounds for temporal fusion')
 parser.add_argument('--ablation_no_multi_scale', action='store_true', default=False, help='Ablation study: disable multi-scale feature fusion')
 parser.add_argument('--ablation_no_trajectory', action='store_true', default=False, help='Ablation study: disable LSTM trajectory analysis')
-# train
 parser.add_argument('--num_epochs', type=int, default=500)
 parser.add_argument('--lr_scheduler', type=str, default=None)
 parser.add_argument('--early_stop_patience', type=int, default=50, help='Early stop patience')
@@ -90,57 +80,48 @@ parser.add_argument('-num_workers', type=int, default=4)
 parser.add_argument('--num_clicks', type=int, default=5)
 args = parser.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(i) for i in args.gpu_ids])
-
 logger = logging.getLogger(__name__)
 LOG_OUT_DIR = join(args.work_dir, args.task_name)
-
 device = args.device
 MODEL_SAVE_PATH = join(args.work_dir, args.task_name)
 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 def build_model(args):
-        # 根据数据集类型设置num_classes
         if args.dataset.lower() == 'acdc':
             num_classes = 4
         elif args.dataset.lower() == 'btcv':
-            num_classes = 14  # BTCV有14个类别（0-13）
+            num_classes = 14  
         elif args.dataset.lower() == 'amos2022_mr':
-            num_classes = 16  # AMOS2022_MR有16个类别（15个器官+1个背景）
+            num_classes = 16  
         else:
-            num_classes = 4  # 默认值
+            num_classes = 4  
         
         sam = sam_model_registry[args.model_type](args).to(device)
         
-        # 构建TMFNet模型
         imis = TMFNet(
             sam, 
             test_mode=args.test_mode, 
             select_mask_num=args.mask_num,
-            fusion_warmup_epochs=20,      # 预热周期（从第10个epoch开始算）
-            max_fusion_strength=1.5,       # 最终融合强度（对应 sigmoid≈0.82）
-            num_classes=num_classes,         # 传递num_classes参数
+            fusion_warmup_epochs=20,      
+            max_fusion_strength=1.5,       
+            num_classes=num_classes,         
             ablation_no_multi_scale=args.ablation_no_multi_scale,
             ablation_no_trajectory=args.ablation_no_trajectory
         ).to(device)
         
-        # 【关键修改】冻结策略：只冻结Image Encoder，解冻其他关键组件
         print("[INFO] Applying selective freezing strategy...")
         
         for name, param in imis.named_parameters():
             if 'image_encoder' in name:
-                # ✅ 解冻最后6层和neck，而不是4层
                 if ('blocks.11' in name or 'blocks.10' in name or 'blocks.9' in name or
                     'blocks.8' in name or 'blocks.7' in name or 'blocks.6' in name or 'neck' in name):
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
             else:
-                # 确保所有非Image Encoder参数都可学习，特别是时序融合相关参数
                 param.requires_grad = True
                 if 'temporal' in name or 'fusion' in name or 'trajectory' in name or 'lstm' in name:
                     print(f"[INFO] Ensuring temporal parameter is trainable: {name}")
-
-        # 打印可训练参数验证
         trainable_params = sum(p.numel() for p in imis.parameters() if p.requires_grad)
         frozen_params = sum(p.numel() for p in imis.parameters() if not p.requires_grad)
         print(f"[INFO] Total trainable parameters: {trainable_params/1e6:.2f}M")
@@ -151,8 +132,6 @@ def build_model(args):
             imis = DDP(imis, device_ids=[args.rank], output_device=args.rank)
         return imis
 
-
-# Temporal related loss functions
 def compute_dice_coefficient(pred, label):
     """Compute Dice coefficient"""
     assert pred.shape == label.shape
@@ -161,29 +140,23 @@ def compute_dice_coefficient(pred, label):
     union = torch.sum(pred + label, dim=(1, 2, 3))
     dice = (2. * intersection) / (union + 1e-8)
     return dice.mean()
-
-# Import common metric calculation functions from utils
 from utils import compute_iou, get_iou_and_dice
 
 def compute_hausdorff_distance(pred, label):
     """Compute Hausdorff distance"""
-    # Simplified implementation, more precise algorithms may be needed in practice
     assert pred.shape == label.shape
     pred = torch.sigmoid(pred) > 0.5
     label = label > 0
     
-    # Compute boundaries
     pred_boundary = pred - F.max_pool2d(pred, kernel_size=3, stride=1, padding=1)
     label_boundary = label - F.max_pool2d(label, kernel_size=3, stride=1, padding=1)
     
-    # Find boundary points
     pred_points = torch.nonzero(pred_boundary, as_tuple=False)
     label_points = torch.nonzero(label_boundary, as_tuple=False)
     
     if len(pred_points) == 0 or len(label_points) == 0:
         return torch.tensor(0.0, device=pred.device)
     
-    # Calculate distances between points
     distances = F.pairwise_distance(
         pred_points.float(), 
         label_points.float(), 
@@ -194,7 +167,6 @@ def compute_hausdorff_distance(pred, label):
 
 def compute_focal_loss(pred, label, gamma=2.0, alpha=0.25):
     """Compute Focal Loss"""
-
     pred = torch.sigmoid(pred)
     target = label.float()
     pt = pred * target + (1 - pred) * (1 - target)
@@ -206,38 +178,33 @@ def compute_temporal_consistency(current_masks, previous_masks=None):
     if previous_masks is None:
         return 0.0
     
-    # Calculate consistency between current and previous predictions
     consistency = F.mse_loss(torch.sigmoid(current_masks), torch.sigmoid(previous_masks))
     return consistency
 
-# Use TemporalAwareLoss class defined in model.py, keep interface function for compatibility
-def compute_temporal_aware_loss(pred_masks, gt_masks, interaction_round, previous_masks=None, global_epoch=0): 
+def compute_temporal_aware_loss(pred_masks, gt_masks, interaction_round, previous_masks=None, global_epoch=0):
     """Temporal aware loss function (using TemporalAwareLoss class from model.py)"""
     temporal_loss_fn = TemporalAwareLoss()
-    return temporal_loss_fn(pred_masks, gt_masks, previous_masks, interaction_round, global_epoch)
+    return temporal_loss_fn(pred_masks, gt_masks, previous_pred=previous_masks, interaction_round=interaction_round, global_epoch=global_epoch)
 
 class TemporalFusionEvaluator:
     """Temporal fusion performance evaluator"""
     
     def __init__(self): 
         self.metrics = { 
-            'convergence_speed': [],      # Convergence speed 
-            'interaction_efficiency': [], # Interaction efficiency 
-            'temporal_consistency': [],  # Temporal consistency 
-            'final_accuracy': []          # Final accuracy 
+            'convergence_speed': [],      
+            'interaction_efficiency': [], 
+            'temporal_consistency': [],  
+            'final_accuracy': []          
         } 
     
     def evaluate_temporal_performance(self, model, test_loader):
         """Evaluate temporal performance"""
         model.eval()
-
         all_results = []
-        failed_samples = []  # 记录失败样本
-
+        failed_samples = []  
         with torch.no_grad():
             for batch_idx, batch in enumerate(test_loader):
                 try:
-                    # 适配不同batch格式（已有）
                     if isinstance(batch, dict):
                         images = batch.get("image", batch.get("img", None)).to(device)
                         labels = batch.get("label", batch.get("seg", None)).to(device)
@@ -247,15 +214,11 @@ class TemporalFusionEvaluator:
                         images, labels, classes = batch
                         images, labels = images.to(device), labels.to(device)
                         patient_ids = [f"batch_{batch_idx}"]
-
                     interaction_id = 0
                     round_metrics = []
                     prev_masks = None
-
-                    # 模拟多轮交互（最多5轮）
                     for round_idx in range(5):
                         try:
-                            # 优先调用时序提示函数，无则降级
                             if hasattr(model, 'supervised_prompts_with_temporal'):
                                 prompts = model.supervised_prompts_with_temporal(
                                     classes, labels, prev_masks, None, 'points', interaction_id
@@ -264,15 +227,12 @@ class TemporalFusionEvaluator:
                                 prompts = model.supervised_prompts(
                                     classes, labels, None, None, 'points'
                                 )
-
                             prompts['interaction_round'] = round_idx
                             if hasattr(model, '_clear_interaction_history'):
                                 outputs = model(images, prompts, interaction_id=interaction_id)
                             else:
                                 outputs = model(images, prompts)
-
                             pred_masks = outputs['masks']
-                            # 计算当前轮指标
                             round_metrics.append({
                                 'dice': compute_dice_coefficient(pred_masks, labels),
                                 'iou': compute_iou(pred_masks, labels),
@@ -283,7 +243,6 @@ class TemporalFusionEvaluator:
                         except Exception as e:
                             print(f"[WARNING] Error in interaction round {round_idx} for sample {patient_ids[0]}: {str(e)}")
                             break
-
                     if round_metrics:
                         all_results.append(round_metrics)
                     else:
@@ -291,12 +250,8 @@ class TemporalFusionEvaluator:
                 except Exception as e:
                     print(f"[ERROR] Failed to process batch {batch_idx}: {str(e)}")
                     failed_samples.append(f"batch_{batch_idx}")
-
-        # 打印失败样本统计
         if failed_samples:
             print(f"[WARNING] Failed to evaluate {len(failed_samples)} samples: {failed_samples[:10]}...")
-
-        # 分析时序性能
         self._analyze_temporal_patterns(all_results)
         return self.metrics 
     
@@ -308,31 +263,22 @@ class TemporalFusionEvaluator:
             'temporal_consistency': [],
             'final_accuracy': []
         }
-
         for result in all_results:
-            if not result:  # 跳过空结果
+            if not result:  
                 continue
-
-            # 收敛速度：达到0.85 Dice的轮数（无则记为最大轮数）
             convergence_round = None
             for i, metrics in enumerate(result):
                 if metrics['dice'] > 0.85:
                     convergence_round = i + 1
                     break
             self.metrics['convergence_speed'].append(convergence_round or len(result))
-
-            # 交互效率：最终Dice / 交互轮数
             final_dice = result[-1]['dice']
             interaction_efficiency = final_dice / len(result)
             self.metrics['interaction_efficiency'].append(interaction_efficiency)
-
-            # 时序一致性：相邻轮次Dice的方差
             if len(result) >= 2:
                 dice_values = [m['dice'] for m in result]
-                temporal_consistency = np.var(dice_values)  # 方差越小，一致性越高
+                temporal_consistency = np.var(dice_values)  
                 self.metrics['temporal_consistency'].append(temporal_consistency)
-
-            # 最终精度：最后一轮的Dice
             self.metrics['final_accuracy'].append(final_dice)
     
     def get_average_metrics(self):
@@ -355,7 +301,6 @@ class TemporalFusionEvaluator:
         print(f"Average final accuracy: {avg_metrics['final_accuracy']:.4f}")
         print("===========================")
 
-
 class BaseTrainer:
     def __init__(self, model, dataloaders, args):
         """Initialize trainer, removing dependencies on checkpoint_manager and training_monitor"""
@@ -370,102 +315,76 @@ class BaseTrainer:
         self.dices = []
         self.ious = []
         
-        # 早停机制相关变量
-        self.early_stop_patience = getattr(args, 'early_stop_patience', 10)  # 默认10个epoch
+        self.early_stop_patience = getattr(args, 'early_stop_patience', 10)  
         self.early_stop_counter = 0
-        self.best_dice = 0.0  # 用于早停机制的最佳Dice分数
+        self.best_dice = 0.0  
         
-        # Initialize new components
-        # 优化混合精度训练，使用更保守的 scaler 参数
         self.scaler = GradScaler(
-            init_scale=2**10,  # 减小初始缩放因子，避免梯度爆炸
-            growth_factor=1.5,  # 减小增长因子，使缩放更保守
-            backoff_factor=0.6,  # 调整回退因子
-            growth_interval=4000,  # 增加增长间隔，让模型有更多时间稳定
+            init_scale=2**10,  
+            growth_factor=1.5,  
+            backoff_factor=0.6,  
+            growth_interval=4000,  
             enabled=True
         )
         self.set_loss_fn()
         self.build_optimizer()
         
-        # Load checkpoint
         if args.pretrain_path is not None:
             self.load_checkpoint(args.pretrain_path, args.resume)
         else:
             self.start_epoch = 0
             
         print("BaseTrainer initialized, using simplified training logic")
-
     def set_loss_fn(self):
-        # 统一使用 TemporalAwareLoss 作为唯一的分割损失
         if hasattr(self, 'args') and self.args.use_temporal_fusion:
             self.temporal_loss = TemporalAwareLoss()
             self.criterion = self.temporal_loss
         else:
-            # 如果不使用时序融合，使用默认的 BCE 损失
             self.criterion = FocalDice_MSELoss()
-
     def build_optimizer(self):
-        # 【优化】分层学习率，将不同模块的学习率彻底拉开差距
         param_groups = [
-            # 1. 冻结绝大部分，解冻的 ViT 层用极小的学习率（保护预训练特征）
-            {'params': [], 'lr': 5e-5, 'weight_decay': 1e-4},  # SAM Image Encoder 最后6层
+            {'params': [], 'lr': 5e-5, 'weight_decay': 1e-4},  
             
-            # 2. Prompt和Mask Decoder用中等学习率（适应医学图像）
-            {'params': [], 'lr': 5e-4, 'weight_decay': 1e-4},  # Prompt Encoder
-            {'params': [], 'lr': 5e-4, 'weight_decay': 1e-4},  # Mask Decoder
+            {'params': [], 'lr': 5e-4, 'weight_decay': 1e-4},  
+            {'params': [], 'lr': 5e-4, 'weight_decay': 1e-4},  
             
-            # 3. 时序模块用更保守的学习率（防止训练不稳定）
-            {'params': [], 'lr': 2e-4, 'weight_decay': 1e-4},  # 时序相关模块（降低学习率）
+            {'params': [], 'lr': 2e-4, 'weight_decay': 1e-4},  
             
-            # 4. 标量权重专属组
-            {'params': [], 'lr': 1e-3, 'weight_decay': 0.0},   # 标量权重专属组（降低学习率）
+            {'params': [], 'lr': 1e-3, 'weight_decay': 0.0},   
         ]
         
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            # 特殊处理标量权重参数
             if 'trajectory_fusion_weight' in name or 'fusion_weights' in name:
                 param_groups[3]['params'].append(param)
                 logger.debug(f"[DEBUG 优化器] 特殊权重参数: {name} 分配 LR: 1e-4")
-            # Image Encoder - 只解冻最后几层
             elif 'image_encoder' in name:
                 if ('blocks.11' in name or 'blocks.10' in name or 'blocks.9' in name or 'neck' in name):
                     param_groups[0]['params'].append(param)
                 else:
-                    param.requires_grad = False  # 冻结前面的层
-            # Prompt Encoder
+                    param.requires_grad = False  
             elif 'prompt_encoder' in name:
                 param_groups[1]['params'].append(param)
-            # Mask Decoder
             elif 'mask_decoder' in name:
                 param_groups[2]['params'].append(param)
-            # 时序相关模块
             elif 'temporal' in name or 'lstm' in name or 'trajectory' in name or 'fusion' in name:
                 param_groups[2]['params'].append(param)
                 logger.debug(f"[DEBUG 优化器] 添加时序参数: {name} 分配 LR: 5e-5")
-            # 其他参数
             else:
                 param_groups[1]['params'].append(param)
         
-        # 检查各参数组的大小
         for i, group in enumerate(param_groups):
             logger.debug(f"[DEBUG 优化器] 参数组 {i} 大小: {len(group['params'])}，学习率: {group['lr']}")
-
-        # 2. 创建优化器
         self.optimizer = torch.optim.AdamW(param_groups)
-
-        # 【学习率调度器】根据 args.lr_scheduler 选择不同的调度策略
         self.scheduler = None
         if self.args.lr_scheduler == 'cosine':
-            # 余弦退火调度器
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.args.num_epochs,
                 eta_min=1e-6
             )
         elif self.args.lr_scheduler == 'step':
-            # 步级衰减调度器
             step_size = self.args.step_size[0] if isinstance(self.args.step_size, list) else self.args.step_size
             self.scheduler = StepLR(
                 self.optimizer,
@@ -473,17 +392,14 @@ class BaseTrainer:
                 gamma=self.args.gamma
             )
         elif self.args.lr_scheduler == 'multi_step':
-            # 多步衰减调度器
             self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
                 self.optimizer,
                 milestones=self.args.step_size,
                 gamma=self.args.gamma
             )
         elif self.args.lr_scheduler is None or self.args.lr_scheduler.lower() == 'none':
-            # 不使用调度器，保持恒定学习率
             self.scheduler = None
         else:
-            # 默认使用预热 + 余弦退火组合策略
             warmup_epochs = 5
             def warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs, min_lr=1e-5):
                 def lr_lambda(epoch):
@@ -493,72 +409,55 @@ class BaseTrainer:
                         progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
                         return max(0.5 * (1 + math.cos(math.pi * progress)), min_lr / 1e-3)
                 return LambdaLR(optimizer, lr_lambda)
-
             self.scheduler = warmup_cosine_scheduler(
                 self.optimizer,
                 warmup_epochs=warmup_epochs,
                 total_epochs=self.args.num_epochs,
                 min_lr=1e-5
             )
-
         self.warmup_epochs = 0
         
-
-
     def load_checkpoint(self, ckp_path, resume):
         last_ckpt = None
         if os.path.exists(ckp_path):
-            # Fix CUDA device mapping issue, ensure model loads to available device
             if self.args.multi_gpu:
                 dist.barrier()
                 last_ckpt = torch.load(ckp_path, map_location=torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'))
             else:
-                # Use mapping function to ensure model loads to available GPU device
                 def map_location(storage, loc):
-                    # Map any CUDA device to the first available CUDA device or CPU
                     return storage.cuda(0) if torch.cuda.is_available() else storage.cpu()
                 last_ckpt = torch.load(ckp_path, map_location=map_location)
         
         if last_ckpt:
-            # Handle model parameter loading, filter out mismatched parameters
-            # 【关键修复】检查last_ckpt是否直接是模型状态字典
             if isinstance(last_ckpt, dict) and 'model_state_dict' in last_ckpt:
                 model_state_dict = last_ckpt['model_state_dict']
             else:
-                # 如果直接是模型状态字典，就直接使用
                 model_state_dict = last_ckpt
             
             current_state_dict = self.model.state_dict() if not self.args.multi_gpu else self.model.module.state_dict()
             
-            # Filter out mismatched parameters
             filtered_state_dict = {}
             for key, value in model_state_dict.items():
                 if key in current_state_dict and current_state_dict[key].shape == value.shape:
                     filtered_state_dict[key] = value
                 else:
-                    # For newly added modules (e.g., multi-scale temporal fusion), keep current randomly initialized weights
                     pass
             
-            # Print loading information
             print(f"Loaded {len(filtered_state_dict)} parameters from checkpoint")
             print(f"Skipped {len(model_state_dict) - len(filtered_state_dict)} parameters due to shape mismatch")
             print(f"Added {len(current_state_dict) - len(filtered_state_dict)} new parameters")
             
-            # Update current state dict and load
             current_state_dict.update(filtered_state_dict)
             if self.args.multi_gpu:
                 self.model.module.load_state_dict(current_state_dict)
             else:
                 self.model.load_state_dict(current_state_dict)
             
-            # Only load optimizer state when in resume mode and continuing training from the same architecture
             if resume:
                 try:
                     self.start_epoch = last_ckpt['epoch']
-                    # Try to load optimizer state, but reinitialize if parameters don't match
                     try:
                         self.optimizer.load_state_dict(last_ckpt['optimizer_state_dict'])
-                        # 移除学习率重置逻辑，保持分层学习率策略
                         print("Loaded optimizer state dict successfully")
                     except ValueError as e:
                         print(f"Warning: Failed to load optimizer state dict: {e}")
@@ -571,7 +470,6 @@ class BaseTrainer:
                         print(f"Warning: Failed to load scheduler state dict: {e}")
                         print("Scheduler will use current settings")
                     
-                    # Load other training states
                     if 'losses' in last_ckpt:
                         self.losses = last_ckpt['losses']
                     if 'dices' in last_ckpt:
@@ -592,48 +490,35 @@ class BaseTrainer:
         else:
             self.start_epoch = 0
             print(f"No checkpoint found at {ckp_path}, start training from scratch")
-
     
     def save_checkpoint(self, epoch, state_dict, describe="last"):
         """Simplified checkpoint saving method, completely independent of checkpoint_manager"""
         try:
-            # Ensure save directory exists
             if not os.path.exists(MODEL_SAVE_PATH):
                 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
                 print(f"Create save directory: {MODEL_SAVE_PATH}")
             
-            # Build filename
             if describe == 'best' or 'best' in describe:
-                # For best model, add current dice value
                 current_dice = getattr(self, 'current_dice', 0.0)
                 filename = os.path.join(MODEL_SAVE_PATH, f'IMIS_{epoch}_step_dice:{current_dice:.4f}_best.pth')
-                # Also save as generic best filename
                 best_filename = os.path.join(MODEL_SAVE_PATH, f'IMIS_dice_best.pth')
             else:
-                # For latest model
                 filename = os.path.join(MODEL_SAVE_PATH, f'IMIS_latest.pth')
             
-            # Save model directly
             torch.save(state_dict, filename)
             print(f"✅ Checkpoint saved successfully: {filename}")
             
-            # If it's the best model, also save a generic best version
             if describe == 'best' or 'best' in describe:
                 torch.save(state_dict, best_filename)
                 print(f"✅ Best model additionally saved as: {best_filename}")
                 
-            # Record save information
             print(f"Epoch {epoch} - Checkpoint saving completed")
             
         except Exception as e:
             print(f"❌ Error saving checkpoint: {str(e)}")
             import traceback
-            traceback.print_exc()  # Print detailed error stack
-
-
-    # Bind get_iou_and_dice function defined in utils as instance method
+            traceback.print_exc()  
     get_iou_and_dice = staticmethod(get_iou_and_dice)
-
     def plot_result(self, plot_data, description, save_name):
         plt.plot(plot_data)
         plt.title(description)
@@ -641,31 +526,23 @@ class BaseTrainer:
         plt.ylabel(f'{save_name}')
         plt.savefig(join(MODEL_SAVE_PATH, f'{save_name}.png'))
         plt.close()
-
     def train_one_epoch(self, epoch):
         """BaseTrainer的训练方法，用于静态数据集（如Kvasir、BTCV）"""
-        # ================= 1. 初始化与设备对齐 =================
         self.model.train()
         model = self.model.module if self.args.multi_gpu else self.model
         device = next(model.parameters()).device
         
-        # 确保使用正确的训练数据加载器
         self.train_loader = self.dataloaders if not isinstance(self.dataloaders, dict) else self.dataloaders.get('train', self.dataloaders)
         tbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
         epoch_loss, epoch_dice, epoch_iou = 0.0, 0.0, 0.0
         num_steps = len(tbar)
         
-        # 梯度累积设置
-        accumulation_steps = 4  # 每4个batch累积一次梯度
-        step_counter = 0  # 用于跟踪梯度累积的步数
-
-        # ================= 2. 核心训练循环 =================
+        accumulation_steps = 4  
+        step_counter = 0  
         for step, batch in enumerate(tbar):
-            # 打印 batch 开始信息
-            if step % 10 == 0:  # 每10个batch打印一次
+            if step % 10 == 0:  
                 logger.info(f"[INFO] Batch {step+1}/{num_steps}")
             
-            # 【显存管理】每3个batch清理一次显存，防止OOM
             if step % 3 == 0:
                 torch.cuda.empty_cache()
                 gc.collect()
@@ -674,112 +551,80 @@ class BaseTrainer:
             labels = batch["label"].to(device).long()
             batch_size = images.size(0)
             
-            # 【强制从batch获取，没有就报错】
             if 'patient_ids' not in batch or not batch['patient_ids']:
                 raise RuntimeError("Batch中没有patient_ids！请先完成data_loader.py的修改")
             patient_ids = [str(pid) for pid in batch['patient_ids']]
-
             if 'target_list' not in batch or not batch['target_list']:
                 raise RuntimeError("Batch中没有target_list！请先完成data_loader.py的修改")
             
-            # 【调试】打印 target_list 相关信息
             target_list_len = len(batch['target_list'])
             logger.debug(f"[DEBUG target_list] 长度: {target_list_len}, batch_size: {batch_size}, mask_num: {self.args.mask_num}")
             logger.debug(f"[DEBUG target_list] 内容: {batch['target_list']}")
             
-            # 【修复】使用更安全的方式构建 categories
             categories = []
             if target_list_len > 0:
-                # 为每个样本分配一个类别
                 for i in range(len(patient_ids)):
-                    # 确保索引不超出范围
                     idx = min(i, target_list_len - 1)
                     categories.append(batch['target_list'][idx])
             else:
-                # 如果 target_list 为空，使用默认类别
                 categories = [0] * len(patient_ids)
                 print("[WARNING] target_list 为空，使用默认类别 0")
-
             print(f"[DEBUG 数据] 真实病人ID: {patient_ids}, 真实类别: {categories}")
             logger.debug(f"[DEBUG 数据] patient_ids长度: {len(patient_ids)}, categories长度: {len(categories)}")
             
-            # 初始化损失和变量
-            total_loss = 0.0 # 使用浮点数初始化
-            num_interactions = 1  # 静态数据集只需要一轮交互
+            total_loss = 0.0 
+            num_interactions = 1  
             previous_pred = None
             round_loss = 0.0
             image_features = None
             
-            # 🔁 单轮交互前向传播
             for interaction_round in range(num_interactions):
-                # ① 生成点击点 (使用点击模拟逻辑)
                 points, point_labels = self._simulate_clicks(images, labels, previous_pred, interaction_round)
                 
-                # ③ 前向传播
-                # 获取真实的模型对象（处理 DDP 包装）
                 real_model = self.model.module if hasattr(self.model, 'module') else self.model
                 
-                # 先提取图像特征（只在第一轮提取，避免重复计算）
                 if image_features is None and hasattr(self.model, 'image_forward'):
                     image_features = self.model.image_forward(images)
                 
-                # 处理 categories
-                # 确保 categories 的长度与扩展后的 batch size 相同
                 extended_batch_size = image_features.shape[0]
                 if not categories:
                     categories = ["default"] * extended_batch_size
                 elif isinstance(categories, (list, tuple)):
                     if len(categories) != extended_batch_size:
-                        # 如果长度不匹配，扩展 categories
-                        # 重复原始 categories 到所需长度
                         extended_categories = []
                         for cat in categories:
                             extended_categories.extend([cat] * self.args.mask_num)
-                        # 确保长度正确
                         extended_categories = extended_categories[:extended_batch_size]
                         categories = extended_categories
                 else:
-                    # 如果是标量，复制到扩展后的 batch size 长度
                     categories = [str(categories)] * extended_batch_size
                 
-                # 确保 patient_ids 的长度与扩展后的 batch size 相同
                 if not patient_ids:
-                    # 如果为空，生成默认ID
                     patient_ids = [f"patient_{i}" for i in range(extended_batch_size)]
                 elif len(patient_ids) != extended_batch_size:
-                    # 如果长度不匹配，扩展 patient_ids
-                    # 重复原始 patient_ids 到所需长度
                     extended_patient_ids = []
                     for pid in patient_ids:
                         extended_patient_ids.extend([pid] * self.args.mask_num)
-                    # 确保长度正确
                     extended_patient_ids = extended_patient_ids[:extended_batch_size]
                     patient_ids = extended_patient_ids
                 
-                # 构建 Batch 级别的提示字典
                 prompts = {
-                    'patient_ids': patient_ids,   # 使用真实的 patient_ids
+                    'patient_ids': patient_ids,   
                     'categories': categories,     
-                    'interaction_ids': patient_ids, # 使用相同的 ID
-                    'temporal_enabled': False,  # 静态数据集不使用时序融合
+                    'interaction_ids': patient_ids, 
+                    'temporal_enabled': False,  
                     'labels': labels,
                     'interaction_round': interaction_round,
                     'epoch': epoch,
                     'global_epoch': epoch
                 }
                 
-                # 【多类别支持】如果labels是多类别格式（不是one-hot），需要转换为二值mask
-                # BTCV有13个器官类别，labels可能是[C, H, W]格式的one-hot或[N, 1, H, W]格式的batch
                 original_labels = labels
                 if labels.dim() == 4 and labels.shape[1] > 1:
-                    # labels是[C, H, W]或[N, C, H, W]格式，需要转换为二值mask
-                    # 对于每个样本，根据categories中指定的类别提取二值mask
                     binary_labels = []
                     for i in range(labels.shape[0]):
                         if i < len(categories):
-                            # 从类别名称获取类别索引
                             cat_name = categories[i] if isinstance(categories[i], str) else str(categories[i])
-                            # 在target_list中查找类别索引
                             if hasattr(self.args, 'classes') and self.args.classes:
                                 try:
                                     class_idx = self.args.classes.index(cat_name) if cat_name in self.args.classes else 1
@@ -787,7 +632,6 @@ class BaseTrainer:
                                     class_idx = 1
                             else:
                                 class_idx = 1
-                            # 提取对应类别的二值mask
                             if labels.shape[1] > class_idx:
                                 binary_labels.append(labels[i:i+1, class_idx:class_idx+1])
                             else:
@@ -799,96 +643,72 @@ class BaseTrainer:
                     else:
                         labels = (labels.argmax(dim=1, keepdim=True) > 0).float()
                 elif labels.dim() == 3:
-                    # labels是[H, W]格式，添加batch维度
                     labels = labels.unsqueeze(0)
                 
-                # 调用 forward_with_features
-                # 将 autocast 仅包裹前向计算部分，保持梯度流
                 with autocast():
                     if hasattr(self.model, 'forward_with_features'):
                         outputs = self.model.forward_with_features(image_features, prompts)
                     else:
-                        # 回退到标准 forward 方法
                         outputs = self.model.forward(images, prompts)
                 
                 try:
-                    # 直接传递完整的outputs，避免提取时丢失梯度信息
-                    loss = self.criterion(outputs['masks'], labels, previous_pred=previous_pred, interaction_round=interaction_round, global_epoch=epoch)
+                    loss = self.criterion(outputs, labels, interaction_round=interaction_round, previous_pred=previous_pred, global_epoch=epoch, new_click_coords=points)
                 except Exception as e:
                     model_logger.error(f"[FATAL] 前向传播错误: {str(e)}")
                     model_logger.error(f"[FATAL] 病人ID: {patient_ids}, 类别: {categories}")
                     model_logger.error(f"[FATAL] 交互轮次: {interaction_round}")
                     raise e
                 
-                # 致命修复 2：提取后必须强制转换为 float32，杜绝 BCE 和 Focal Loss 的精度溢出！
                 pred_masks = outputs['masks'].float()
-                del outputs  # 立即删除 outputs，释放显存
+                del outputs  
                 
-                # 累加 Loss
                 total_loss += loss
                 
-                # 计算 dice 和 iou 值
                 dice_scores = self._calc_dice(pred_masks, labels)
                 tci_values = self._calc_tci(pred_masks, labels)
                 batch_dice = dice_scores.mean().item()
                 batch_tci = tci_values.mean().item()
                 
-                # 【关键修复】检查batch_dice是否异常
                 if batch_dice > 1.0:
                     print(f"[WARNING] 交互轮次Dice异常: {batch_dice}, 检查计算逻辑")
                     batch_dice = min(batch_dice, 1.0)
                 if batch_tci > 1.0:
                     print(f"[WARNING] 交互轮次TCI异常: {batch_tci}, 检查计算逻辑")
                     batch_tci = min(batch_tci, 1.0)
-                # 打印调试信息
                 if batch_dice == 0:
                     print(f"[DEBUG] Batch dice is 0! pred_masks shape: {pred_masks.shape}, labels shape: {labels.shape}")
                     print(f"[DEBUG] pred_masks min: {pred_masks.min().item()}, max: {pred_masks.max().item()}")
                     print(f"[DEBUG] labels sum: {labels.sum().item()}")
                     print(f"[DEBUG] pred_masks sigmoid sum: {torch.sigmoid(pred_masks).sum().item()}")
-                # 打印当前交互轮次的dice值，查看交互效果
                 print(f"[交互监控] 轮次 {interaction_round+1}/{num_interactions} - Dice: {batch_dice:.4f}, TCI: {batch_tci:.4f}")
                 
-                # 【关键】previous_pred只保留detach后的版本，且移到CPU节省显存
                 previous_pred = pred_masks.detach().cpu()
-                # 保存 pred_masks 用于后续计算后再删除
                 final_pred_masks = pred_masks.detach()
                 del pred_masks
-                round_loss = loss.item()  # 记录loss后再删除
+                round_loss = loss.item()  
                 del loss
             
-            # 循环结束后统一反向传播
             if torch.is_tensor(total_loss) and total_loss.requires_grad:
-                # 致命修复 3：如果总 Loss 已经是 NaN，直接跳过整个 Batch 的参数更新！
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
                     logger.error(
                         f"[FATAL] 当前 Batch 的 Total Loss 为 NaN/Inf! 放弃参数更新，防止模型权重崩溃。"
                     )
                     self.optimizer.zero_grad()
-                    step_counter += 1  # 仍然增加step_counter，避免累积逻辑混乱
+                    step_counter += 1  
                 else:
-                    # 梯度累积
                     step_counter += 1
                     self.scaler.scale(total_loss / num_interactions).backward()
                     
-                    # 每accumulation_steps个batch更新一次参数
                     if step_counter % accumulation_steps == 0:
-                        # 梯度裁剪
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        # 更新参数
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-                        # 清零梯度
                         self.optimizer.zero_grad()
                         
-                        # 打印梯度累积信息
                         logger.info(f"[梯度累积] 完成 {accumulation_steps} 个batch的梯度累积，更新参数")
             
-            # 处理剩余的梯度
             if step_counter % accumulation_steps != 0 and step == num_steps - 1:
-                # 最后一个batch，处理剩余的梯度
-                # 检查是否有有效的梯度
                 has_valid_grad = any(p.grad is not None and not torch.isnan(p.grad).any() and not torch.isinf(p.grad).any() 
                                      for p in self.model.parameters())
                 
@@ -906,11 +726,8 @@ class BaseTrainer:
             
             else:
                 print("[WARNING] Total loss has no grad, skipping optimizer step.")
-                # 【修复】当没有进行梯度缩放时，不要调用scaler.update()
                     
-            # ================= 3. 指标累加 =================
             with torch.no_grad():
-                # 【关键修复】添加调试信息
                 print(f"[DEBUG] final_pred_masks shape: {final_pred_masks.shape}, labels shape: {labels.shape}")
                 print(f"[DEBUG] final_pred_masks min: {final_pred_masks.min().item()}, max: {final_pred_masks.max().item()}")
                 print(f"[DEBUG] labels min: {labels.min().item()}, max: {labels.max().item()}")
@@ -918,14 +735,12 @@ class BaseTrainer:
                 dice_scores = self._calc_dice(final_pred_masks, labels)
                 tci_scores = self._calc_tci(final_pred_masks, labels)
                 
-                # 【关键修复】检查dice_scores和tci_scores是否异常
                 print(f"[DEBUG] dice_scores: {dice_scores}")
                 print(f"[DEBUG] tci_scores: {tci_scores}")
                 
                 batch_dice = dice_scores.mean().item()
                 batch_iou = tci_scores.mean().item()
                 
-                # 【关键修复】检查batch_dice和batch_iou是否异常
                 if batch_dice > 1.0:
                     print(f"[WARNING] 批量Dice异常: {batch_dice}, 检查计算逻辑")
                     batch_dice = min(batch_dice, 1.0)
@@ -933,19 +748,16 @@ class BaseTrainer:
                     print(f"[WARNING] 批量IoU异常: {batch_iou}, 检查计算逻辑")
                     batch_iou = min(batch_iou, 1.0)
                 
-                # 【关键修复】计算完成后将final_pred_masks移到CPU释放显存
                 final_pred_masks = final_pred_masks.detach().cpu()
                     
             epoch_loss += round_loss
             epoch_dice += batch_dice
             epoch_iou += batch_iou
         
-        # ================= 4. 计算平均指标 =================
         avg_loss = epoch_loss / num_steps
         avg_dice = epoch_dice / num_steps
         avg_iou = epoch_iou / num_steps
         
-        # 【关键修复】检查平均指标是否异常
         if avg_dice > 1.0:
             print(f"[WARNING] 平均Dice异常: {avg_dice}, 检查计算逻辑")
             avg_dice = min(avg_dice, 1.0)
@@ -953,16 +765,13 @@ class BaseTrainer:
             print(f"[WARNING] 平均IoU异常: {avg_iou}, 检查计算逻辑")
             avg_iou = min(avg_iou, 1.0)
         
-        # 打印epoch结束信息
         print(f"[Epoch 结束] 平均Loss: {avg_loss:.4f}, 平均Dice: {avg_dice:.4f}, 平均IoU: {avg_iou:.4f}")
         
-        # 返回指标
         return {
             'loss': avg_loss,
             'dice': avg_dice,
             'iou': avg_iou
         }
-
     def _simulate_clicks(self, images, labels, previous_pred, round_idx):
         """模拟点击点生成"""
         batch_size = labels.size(0)
@@ -970,16 +779,13 @@ class BaseTrainer:
         point_labels = []
         
         for i in range(batch_size):
-            # 找到前景像素
             foreground = (labels[i] == 1).nonzero(as_tuple=True)
             if len(foreground[0]) > 0:
-                # 随机选择一个前景像素
                 idx = torch.randint(0, len(foreground[0]), (1,))
                 y, x = foreground[0][idx], foreground[1][idx]
                 points.append(torch.tensor([[x.item(), y.item()]]))
                 point_labels.append(torch.tensor([1]))
             else:
-                # 如果没有前景，随机选择一个背景点
                 h, w = labels.size(1), labels.size(2)
                 x = torch.randint(0, w, (1,))
                 y = torch.randint(0, h, (1,))
@@ -989,157 +795,100 @@ class BaseTrainer:
         points = torch.stack(points).to(labels.device)
         point_labels = torch.stack(point_labels).to(labels.device)
         return points, point_labels
-
     def _calc_dice(self, pred, gt):
         """计算Dice系数"""
-        # 确保 pred 和 gt 尺寸匹配
         if pred.shape[2:] != gt.shape[2:]:
             pred = F.interpolate(pred, size=gt.shape[2:], mode='bilinear', align_corners=False)
         
-        # 确保 gt 是 float 类型且是二进制格式
         if gt.dtype == torch.long:
             gt = gt.float()
         
-        # 如果 gt 有多个通道（二值分割通常是1通道），取第一个通道或转为二进制
         if gt.dim() == 4 and gt.shape[1] > 1:
-            # 多类分割，转为背景/前景
             gt = (gt.argmax(dim=1, keepdim=True) > 0).float()
         elif gt.dim() == 4 and gt.shape[1] == 1:
             gt = (gt > 0).float()
         
-        # 使用更合理的阈值 0.5（对应 sigmoid 输入约 -0.85）
         pred_bin = (torch.sigmoid(pred) > 0.5).float()
         
-        # 确保 pred_bin 和 gt 的维度完全匹配
         if pred_bin.shape != gt.shape:
-            # 打印维度不匹配信息
             print(f"[WARNING] 维度不匹配: pred_bin.shape={pred_bin.shape}, gt.shape={gt.shape}")
-            # 处理批次维度
             if pred_bin.shape[0] != gt.shape[0]:
                 print(f"[ERROR] 批次维度不匹配: pred_bin={pred_bin.shape[0]}, gt={gt.shape[0]}")
-                # 取最小批次大小
                 min_batch = min(pred_bin.shape[0], gt.shape[0])
                 pred_bin = pred_bin[:min_batch]
                 gt = gt[:min_batch]
-            # 处理通道维度
             if pred_bin.dim() == 4 and pred_bin.shape[1] != gt.shape[1]:
                 if pred_bin.shape[1] > 1 and gt.shape[1] == 1:
                     pred_bin = pred_bin.argmax(dim=1, keepdim=True).float()
                 else:
-                    # 确保通道数一致
                     pred_bin = pred_bin[:, :1]
-            # 处理空间维度
             if pred_bin.shape[2:] != gt.shape[2:]:
                 pred_bin = F.interpolate(pred_bin, size=gt.shape[2:], mode='bilinear', align_corners=False)
         
-        # 确保 pred_bin 和 gt 都是二进制的（0或1）
         pred_bin = torch.clamp(pred_bin, 0, 1)
         gt = torch.clamp(gt, 0, 1)
-
-        # 计算交集和并集
-        inter = (pred_bin * gt).sum(dim=(1, 2, 3))  # 每个样本的交集
-        pred_sum = pred_bin.sum(dim=(1, 2, 3))  # 每个样本的预测前景
-        gt_sum = gt.sum(dim=(1, 2, 3))  # 每个样本的真实前景
-        union = pred_sum + gt_sum - inter  # 每个样本的并集（正确计算）
-
-        # 避免除零错误
+        inter = (pred_bin * gt).sum(dim=(1, 2, 3))  
+        pred_sum = pred_bin.sum(dim=(1, 2, 3))  
+        gt_sum = gt.sum(dim=(1, 2, 3))  
+        union = pred_sum + gt_sum - inter  
         epsilon = 1e-6
         dice = torch.zeros_like(inter, dtype=torch.float32)
-
-        # 【关键修复】处理边界情况：当真实标签没有前景区域时
-        # 情况1：gt没有前景(gt_sum=0)且pred也没有前景(pred_sum=0) -> Dice=1.0（正确预测背景），但该样本无效
-        # 情况2：gt没有前景(gt_sum=0)但pred有前景(pred_sum>0) -> Dice=0（假阳性）
-        # 情况3：正常情况，使用标准Dice公式
-        valid_mask = gt_sum > 0  # 只有真实标签有前景的样本才有效
+        valid_mask = gt_sum > 0  
         if valid_mask.any():
             valid_inter = inter[valid_mask]
             valid_union = union[valid_mask]
             dice[valid_mask] = (2 * valid_inter + epsilon) / (valid_union + epsilon)
-
-        # 检查异常值
         if torch.isnan(dice).any() or (dice > 1.0).any() or (dice < 0).any():
             print(f"[WARNING] Dice异常: dice={dice}")
             print(f"[DEBUG] inter={inter}, pred_sum={pred_sum}, gt_sum={gt_sum}, union={union}")
-            # 强制限制在合理范围内
             dice = torch.clamp(dice, 0.0, 1.0)
-
         return dice
-
     def _calc_tci(self, pred, gt):
         """计算IoU系数（用于静态数据集）"""
-        # 确保 pred 和 gt 尺寸匹配
         if pred.shape[2:] != gt.shape[2:]:
             pred = F.interpolate(pred, size=gt.shape[2:], mode='bilinear', align_corners=False)
         
-        # 确保 gt 是 float 类型且是二进制格式
         if gt.dtype == torch.long:
             gt = gt.float()
         
-        # 如果 gt 有多个通道（二值分割通常是1通道），取第一个通道或转为二进制
         if gt.dim() == 4 and gt.shape[1] > 1:
-            # 多类分割，转为背景/前景
             gt = (gt.argmax(dim=1, keepdim=True) > 0).float()
         elif gt.dim() == 4 and gt.shape[1] == 1:
             gt = (gt > 0).float()
         
-        # 使用更合理的阈值 0.5（对应 sigmoid 输入约 -0.85）
         pred_bin = (torch.sigmoid(pred) > 0.5).float()
         
-        # 确保 pred_bin 和 gt 的维度完全匹配
         if pred_bin.shape != gt.shape:
-            # 处理批次维度
             if pred_bin.shape[0] != gt.shape[0]:
-                # 取最小批次大小
                 min_batch = min(pred_bin.shape[0], gt.shape[0])
                 pred_bin = pred_bin[:min_batch]
                 gt = gt[:min_batch]
-            # 处理通道维度
             if pred_bin.dim() == 4 and pred_bin.shape[1] != gt.shape[1]:
                 if pred_bin.shape[1] > 1 and gt.shape[1] == 1:
                     pred_bin = pred_bin.argmax(dim=1, keepdim=True).float()
                 else:
-                    # 确保通道数一致
                     pred_bin = pred_bin[:, :1]
-            # 处理空间维度
             if pred_bin.shape[2:] != gt.shape[2:]:
                 pred_bin = F.interpolate(pred_bin, size=gt.shape[2:], mode='bilinear', align_corners=False)
         
-        # 确保 pred_bin 和 gt 都是二进制的（0或1）
         pred_bin = torch.clamp(pred_bin, 0, 1)
         gt = torch.clamp(gt, 0, 1)
-
-        # 计算交集和并集
-        inter = (pred_bin * gt).sum(dim=(1, 2, 3))  # 每个样本的交集
-        pred_sum = pred_bin.sum(dim=(1, 2, 3))  # 每个样本的预测前景
-        gt_sum = gt.sum(dim=(1, 2, 3))  # 每个样本的真实前景
-        union = pred_sum + gt_sum - inter  # 每个样本的并集（正确计算）
-
-        # 避免除零错误
+        inter = (pred_bin * gt).sum(dim=(1, 2, 3))  
+        pred_sum = pred_bin.sum(dim=(1, 2, 3))  
+        gt_sum = gt.sum(dim=(1, 2, 3))  
+        union = pred_sum + gt_sum - inter  
         epsilon = 1e-6
         iou = torch.zeros_like(inter, dtype=torch.float32)
-
-        # 【关键修复】处理边界情况：当真实标签没有前景区域时
-        # 只有真实标签有前景的样本才参与IoU计算
         valid_mask = gt_sum > 0
         if valid_mask.any():
             valid_inter = inter[valid_mask]
             valid_union = union[valid_mask]
             iou[valid_mask] = (valid_inter + epsilon) / (valid_union + epsilon)
-
-        # 检查异常值
         if torch.isnan(iou).any() or (iou > 1.0).any() or (iou < 0).any():
             print(f"[WARNING] IoU异常: iou={iou}")
             print(f"[DEBUG] inter={inter}, pred_sum={pred_sum}, gt_sum={gt_sum}, union={union}")
-            # 强制限制在合理范围内
             iou = torch.clamp(iou, 0.0, 1.0)
-
         return iou
-
-
-
-
-
-
 
 class SmartCheckpointManager:
     def __init__(self, save_dir, max_checkpoints=5):
@@ -1160,7 +909,6 @@ class SmartCheckpointManager:
         filename = f"IMIS_{describe}_{epoch:04d}.pth"
         torch.save(checkpoint, join(self.save_dir, filename))
         
-        # Automatically clean up old checkpoints
         self._cleanup_old_checkpoints()
     
     def _cleanup_old_checkpoints(self):
@@ -1170,43 +918,35 @@ class SmartCheckpointManager:
             for old_ckpt in checkpoints[:-self.max_checkpoints]:
                 os.remove(join(self.save_dir, old_ckpt))
 
-
 class ModelDiagnosticTool:
     """模型诊断和分析工具，用于监控训练过程中的关键指标"""
     def __init__(self, save_dir):
         self.save_dir = save_dir
         self.metrics_history = defaultdict(list)
-        self.temporal_metrics = defaultdict(list)  # 时序相关指标
-        self.gradient_stats = []  # 梯度统计信息
+        self.temporal_metrics = defaultdict(list)  
+        self.gradient_stats = []  
         
     def update_metrics(self, epoch, metrics_dict, temporal_info=None, gradient_info=None):
         """Update and visualize training metrics"""
-        # 更新基本指标
         for metric_name, value in metrics_dict.items():
             self.metrics_history[metric_name].append(value)
         
-        # 更新时序相关指标
         if temporal_info:
             for key, value in temporal_info.items():
                 self.temporal_metrics[key].append(value)
         
-        # 更新梯度信息
         if gradient_info:
             self.gradient_stats.append(gradient_info)
         
-        # 实时绘制指标曲线
         self._plot_metrics(epoch)
         
-        # 保存指标到CSV
         self._save_metrics_to_csv()
         
-        # 生成诊断报告
         if epoch % 10 == 0:
             self._generate_diagnostic_report(epoch)
     
     def _plot_metrics(self, epoch):
         """动态绘制指标图表"""
-        # 基本指标图表
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         
         metrics_to_plot = ['loss', 'dice', 'iou', 'learning_rate']
@@ -1219,7 +959,6 @@ class ModelDiagnosticTool:
                 ax.set_ylabel(metric)
                 ax.grid(True)
                 
-                # 为dice添加最佳值标记
                 if metric == 'dice' and self.metrics_history[metric]:
                     best_idx = np.argmax(self.metrics_history[metric])
                     best_value = self.metrics_history[metric][best_idx]
@@ -1235,10 +974,8 @@ class ModelDiagnosticTool:
         plt.savefig(join(self.save_dir, f'training_metrics_epoch_{epoch:04d}.png'))
         plt.close()
         
-        # 单独保存dice曲线
         self._plot_single_metric(epoch, 'dice', 'Dice Score')
         
-        # 时序指标图表
         if self.temporal_metrics:
             self._plot_temporal_metrics(epoch)
     
@@ -1250,13 +987,11 @@ class ModelDiagnosticTool:
         plt.figure(figsize=(10, 6))
         plt.plot(self.metrics_history[metric_name], 'b-', linewidth=2)
         
-        # 添加网格和标签
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.title(title, fontsize=16)
         plt.xlabel('Epoch', fontsize=14)
         plt.ylabel(title, fontsize=14)
         
-        # 标记最佳值
         best_idx = np.argmax(self.metrics_history[metric_name]) if metric_name in ['dice', 'iou'] else np.argmin(self.metrics_history[metric_name])
         best_value = self.metrics_history[metric_name][best_idx]
         plt.scatter(best_idx, best_value, color='red', s=100, zorder=5)
@@ -1267,7 +1002,6 @@ class ModelDiagnosticTool:
                    fontsize=12,
                    color='red')
         
-        # 设置坐标轴范围以突出变化
         plt.ylim(max(0, np.min(self.metrics_history[metric_name]) - 0.1), 
                 min(1.0, np.max(self.metrics_history[metric_name]) + 0.1))
         
@@ -1297,23 +1031,18 @@ class ModelDiagnosticTool:
         """保存指标到CSV文件"""
         csv_path = join(self.save_dir, 'training_metrics.csv')
         
-        # 获取所有指标名称
         metric_names = list(self.metrics_history.keys())
         if not metric_names:
             return
         
-        # 确定最大行数
         max_length = max(len(values) for values in self.metrics_history.values())
         
-        # 写入CSV
         with open(csv_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            # 写入表头
             writer.writerow(['epoch'] + metric_names)
             
-            # 写入数据
             for i in range(max_length):
-                row = [i + 1]  # Epoch number starting from 1
+                row = [i + 1]  
                 for metric in metric_names:
                     if i < len(self.metrics_history[metric]):
                         row.append(self.metrics_history[metric][i])
@@ -1329,7 +1058,6 @@ class ModelDiagnosticTool:
             f.write(f"Model Diagnostic Report - Epoch {epoch}\n")
             f.write("=" * 50 + "\n")
             
-            # 基本指标
             f.write("\n1. Basic Metrics:\n")
             for metric, values in self.metrics_history.items():
                 if values:
@@ -1337,7 +1065,6 @@ class ModelDiagnosticTool:
                     best = max(values) if metric in ['dice', 'iou'] else min(values)
                     f.write(f"  {metric}: latest={latest:.4f}, best={best:.4f}\n")
             
-            # 时序指标
             if self.temporal_metrics:
                 f.write("\n2. Temporal Metrics:\n")
                 for metric, values in self.temporal_metrics.items():
@@ -1345,7 +1072,6 @@ class ModelDiagnosticTool:
                         latest = values[-1]
                         f.write(f"  {metric}: latest={latest:.4f}\n")
             
-            # 训练状态分析
             f.write("\n3. Training Status Analysis:\n")
             if len(self.metrics_history.get('dice', [])) > 5:
                 recent_dice = self.metrics_history['dice'][-5:]
@@ -1357,7 +1083,6 @@ class ModelDiagnosticTool:
                 else:
                     f.write("  ✗ Dice score is not improving\n")
             
-            # 学习率分析
             if 'learning_rate' in self.metrics_history:
                 current_lr = self.metrics_history['learning_rate'][-1]
                 f.write(f"  Current learning rate: {current_lr:.6f}\n")
@@ -1372,10 +1097,8 @@ class TrainingMonitor:
         for metric_name, value in metrics_dict.items():
             self.metrics_history[metric_name].append(value)
         
-        # Real-time plot metrics curves
         self._plot_metrics(epoch)
         
-        # Save metrics to CSV
         self._save_metrics_to_csv()
     
     def _plot_metrics(self, epoch):
@@ -1392,7 +1115,6 @@ class TrainingMonitor:
                 ax.set_ylabel(metric)
                 ax.grid(True)
                 
-                # Add special handling for dice to highlight best value
                 if metric == 'dice' and self.metrics_history[metric]:
                     best_idx = np.argmax(self.metrics_history[metric])
                     best_value = self.metrics_history[metric][best_idx]
@@ -1408,7 +1130,6 @@ class TrainingMonitor:
         plt.savefig(join(self.save_dir, f'training_metrics_epoch_{epoch:04d}.png'))
         plt.close()
         
-        # Also save separate dice curve for easy viewing
         self._plot_single_metric(epoch, 'dice', 'Dice Score')
     
     def _plot_single_metric(self, epoch, metric_name, title):
@@ -1419,13 +1140,11 @@ class TrainingMonitor:
         plt.figure(figsize=(10, 6))
         plt.plot(self.metrics_history[metric_name], 'b-', linewidth=2)
         
-        # Add grid and labels
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.title(title, fontsize=16)
         plt.xlabel('Epoch', fontsize=14)
         plt.ylabel(title, fontsize=14)
         
-        # Mark best value
         best_idx = np.argmax(self.metrics_history[metric_name]) if metric_name in ['dice', 'iou'] else np.argmin(self.metrics_history[metric_name])
         best_value = self.metrics_history[metric_name][best_idx]
         plt.scatter(best_idx, best_value, color='red', s=100, zorder=5)
@@ -1436,7 +1155,6 @@ class TrainingMonitor:
                    fontsize=12,
                    color='red')
         
-        # Set axis range to highlight changes
         plt.ylim(max(0, np.min(self.metrics_history[metric_name]) - 0.1), 
                 min(1.0, np.max(self.metrics_history[metric_name]) + 0.1))
         
@@ -1448,23 +1166,18 @@ class TrainingMonitor:
         """Save metrics to CSV file"""
         csv_path = join(self.save_dir, 'training_metrics.csv')
         
-        # Get all metric names
         metric_names = list(self.metrics_history.keys())
         if not metric_names:
             return
         
-        # Determine maximum row count
         max_length = max(len(values) for values in self.metrics_history.values())
         
-        # Write to CSV
         with open(csv_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            # Write header
             writer.writerow(['epoch'] + metric_names)
             
-            # Write data
             for i in range(max_length):
-                row = [i + 1]  # Epoch number starting from 1
+                row = [i + 1]  
                 for metric in metric_names:
                     if i < len(self.metrics_history[metric]):
                         row.append(self.metrics_history[metric][i])
@@ -1476,7 +1189,6 @@ class TemporalTrainer(BaseTrainer):
     def __init__(self, model, dataloaders, args):
         """Initialize temporal trainer"""
         super().__init__(model, dataloaders, args)
-        # 只解冻Image Encoder最后4层和neck，和build_model策略一致
         if hasattr(self.model, 'image_encoder'):
             for name, param in self.model.image_encoder.named_parameters():
                 if ('blocks.11' in name or 'blocks.10' in name or 'blocks.9' in name or
@@ -1485,10 +1197,8 @@ class TemporalTrainer(BaseTrainer):
                 else:
                     param.requires_grad = False
             print("SAM Image Encoder: last 6 blocks + neck unfrozen")
-        # Fix parameter name to match args
         self.interaction_rounds = args.num_clicks
         self.scaler = GradScaler()
-        # Initialize best metrics
         self.best_loss = float('inf')
         self.best_iou = 0.0
         self.best_dice = 0.0
@@ -1496,22 +1206,17 @@ class TemporalTrainer(BaseTrainer):
         self.losses = []
         self.dices = []
         self.ious = []
-        # 从 args.classes 获取目标类别列表（移除背景类）
         self.target_list = [c for c in args.classes if c != 'background'] if args.classes else ['LV', 'RV', 'Myo']
         self.temporal_loss = TemporalAwareLoss()
-        # 添加融合预热参数
-        self.fusion_warmup_epochs = 20      # 预热周期（从第10个epoch开始算）
-        self.max_fusion_strength = 1.5      # 最终融合强度（对应 sigmoid≈0.82）
+        self.fusion_warmup_epochs = 20      
+        self.max_fusion_strength = 1.5      
         print(f"✅ TemporalTrainer initialized, temporal interaction rounds: {self.interaction_rounds}")
         print(f"✅ Fusion parameters: warmup_epochs={self.fusion_warmup_epochs}, max_strength={self.max_fusion_strength}")
-
     def _save_direct_checkpoint(self, epoch, state_dict, describe='latest'):
         """Save checkpoint directly to file, independent of checkpoint_manager"""
         try:
-            # Ensure save directory exists
             os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
             
-            # Build checkpoint dictionary
             checkpoint = {
                 'model_state_dict': state_dict,
                 'epoch': epoch,
@@ -1525,21 +1230,17 @@ class TemporalTrainer(BaseTrainer):
                 'lr_scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None
             }
             
-            # Build filename based on description
             if describe == 'latest':
                 filename = os.path.join(MODEL_SAVE_PATH, 'IMIS_latest.pth')
             elif describe == 'dice_best':
                 filename = os.path.join(MODEL_SAVE_PATH, f'IMIS_{epoch}_step_dice:{self.best_dice:.4f}_best.pth')
-                # Also save a generic best version
                 generic_best = os.path.join(MODEL_SAVE_PATH, 'IMIS_dice_best.pth')
             else:
                 filename = os.path.join(MODEL_SAVE_PATH, f'IMIS_{describe}.pth')
             
-            # Save checkpoint
             torch.save(checkpoint, filename)
             print(f"Save checkpoint to {filename}")
             
-            # If it's the best dice, also save generic best version
             if describe == 'dice_best':
                 torch.save(checkpoint, generic_best)
                 print(f"Save generic best checkpoint to {generic_best}")
@@ -1564,16 +1265,13 @@ class TemporalTrainer(BaseTrainer):
         point_labels = []
         
         for i in range(batch_size):
-            # 找到前景像素
             foreground = (labels[i] == 1).nonzero(as_tuple=True)
             if len(foreground[0]) > 0:
-                # 随机选择一个前景像素
                 idx = torch.randint(0, len(foreground[0]), (1,))
                 y, x = foreground[0][idx], foreground[1][idx]
                 points.append(torch.tensor([[x.item(), y.item()]]))
                 point_labels.append(torch.tensor([1]))
             else:
-                # 如果没有前景，随机选择一个背景点
                 h, w = labels.size(1), labels.size(2)
                 x = torch.randint(0, w, (1,))
                 y = torch.randint(0, h, (1,))
@@ -1595,7 +1293,6 @@ class TemporalTrainer(BaseTrainer):
             points: 点击点坐标 [B, N, 2]
             point_labels: 点击点标签 [B, N]
         """
-        # 【关键修复】确保 prev_pred 和 labels 在同一设备上
         if prev_pred.device != labels.device:
             prev_pred = prev_pred.to(labels.device)
         
@@ -1604,62 +1301,53 @@ class TemporalTrainer(BaseTrainer):
         point_labels = []
         
         for i in range(batch_size):
-            # 计算预测误差
             pred_bin = (torch.sigmoid(prev_pred[i]) > 0.5).float()
             error_map = torch.abs(pred_bin - labels[i])
             
             if error_map.sum() == 0:
-                # 无错误，随机取前景点
                 fg = (labels[i] == 1).nonzero(as_tuple=False)
                 if len(fg) > 0:
                     idx = torch.randint(0, len(fg), (1,))
                     y, x = fg[idx, 0], fg[idx, 1]
                 else:
-                    # 动态获取形状信息
-                    if len(labels.shape) == 4:  # [B, C, H, W]
+                    if len(labels.shape) == 4:  
                         _, _, h, w = labels.shape
-                    else:  # [B, H, W]
+                    else:  
                         h, w = labels.size(1), labels.size(2)
                     y, x = torch.randint(0, h, (1,)), torch.randint(0, w, (1,))
                 points.append(torch.tensor([[x.item(), y.item()]]))
                 point_labels.append(torch.tensor([1]))
             else:
-                # 找出最大连通误差区域（使用 scipy.label）
                 import numpy as np
                 from scipy.ndimage import label, distance_transform_edt
                 
                 error_np = error_map.cpu().numpy().squeeze()
                 labeled, n = label(error_np)
                 if n == 0:
-                    # 如果没有标记区域，随机选择一个误差点
                     error_indices = torch.nonzero(error_map.view(-1)).squeeze(-1)
                     random_idx = torch.randint(0, len(error_indices), (1,)).item()
                     idx = error_indices[random_idx].item()
-                    # 动态获取形状信息
-                    if len(labels.shape) == 4:  # [B, C, H, W]
+                    if len(labels.shape) == 4:  
                         _, _, h, w = labels.shape
-                    else:  # [B, H, W]
+                    else:  
                         h, w = labels.size(1), labels.size(2)
                     y = idx // w
                     x = idx % w
                 else:
-                    # 找到最大连通区域
                     sizes = np.bincount(labeled.ravel())
                     largest_idx = np.argmax(sizes[1:]) + 1
                     max_region = (labeled == largest_idx).astype(np.uint8)
-                    # 距离变换找几何中心
                     dist = distance_transform_edt(max_region)
                     cy, cx = np.unravel_index(np.argmax(dist), dist.shape)
                     y, x = cy, cx
                 
-                # 动态获取形状信息
-                if len(labels.shape) == 4:  # [B, C, H, W]
+                if len(labels.shape) == 4:  
                     true_label = labels[i, 0, y, x].long()
-                else:  # [B, H, W]
+                else:  
                     true_label = labels[i, y, x].long()
                 
-                points.append(torch.tensor([[x, y]]))  # x, y
-                point_labels.append(torch.tensor([1 - true_label]))  # 真实标签的反
+                points.append(torch.tensor([[x, y]]))  
+                point_labels.append(torch.tensor([1 - true_label]))  
         
         points = torch.stack(points).to(labels.device)
         point_labels = torch.stack(point_labels).to(labels.device)
@@ -1668,21 +1356,16 @@ class TemporalTrainer(BaseTrainer):
     def _simulate_clicks(self, images, labels, previous_pred, round_idx):
         """替换为你的质量门控点击生成逻辑，返回 points [B, N, 2] 和 labels [B, N]"""
         if previous_pred is None or round_idx == 0:
-            # 首轮：从GT随机采样正负点
             points, point_labels = self._get_extreme_clicks(labels)
         else:
-            # 后续轮次：从误差区域采样
             points, point_labels = self._get_error_based_clicks(previous_pred, labels)
         
-        # 添加高斯噪声到点击点（训练时）
         if self.model.training:
-            # 高斯噪声，std=1.0
-            points = points.float()  # 转换为float类型
+            points = points.float()  
             noise = torch.randn_like(points) * 1.0
             points = points + noise
             
-            # 随机丢弃一部分点（训练时 dropout）
-            dropout_prob = 0.2  # 20% 的概率丢弃点
+            dropout_prob = 0.2  
             mask = torch.rand(points.shape[0], points.shape[1], 1, device=points.device) > dropout_prob
             points = points * mask.float()
             point_labels = point_labels * mask.squeeze(-1).float()
@@ -1694,8 +1377,6 @@ class TemporalTrainer(BaseTrainer):
         B, N = points.shape[:2]
         device = points.device
         seq = torch.zeros(B, round_idx + 1, 4, device=device)
-        # 填充当前轮次（假设前round_idx轮已缓存，此处仅填最新点击）
-        # 确保索引不越界，当 round_idx >= N 时使用最后一个可用的点击点
         idx = min(round_idx, N-1)
         seq[:, round_idx, :2] = points[:, idx, :]
         seq[:, round_idx, 2] = point_labels[:, idx]
@@ -1703,101 +1384,77 @@ class TemporalTrainer(BaseTrainer):
         return seq
     
     def _calc_dice(self, pred, gt):
-        # 【关键修复】确保 pred 和 gt 尺寸匹配
         if pred.shape[2:] != gt.shape[2:]:
             pred = F.interpolate(pred, size=gt.shape[2:], mode='bilinear', align_corners=False)
         
-        # 【关键修复】确保 gt 是 float 类型且是二进制格式
         if gt.dtype == torch.long:
             gt = gt.float()
         
-        # 如果 gt 有多个通道（二值分割通常是1通道），取第一个通道或转为二进制
         if gt.dim() == 4 and gt.shape[1] > 1:
-            # 多类分割，转为背景/前景
             gt = (gt.argmax(dim=1, keepdim=True) > 0).float()
         elif gt.dim() == 4 and gt.shape[1] == 1:
             gt = (gt > 0).float()
         
-        # 使用更合理的阈值 0.5（对应 sigmoid 输入约 -0.85）
         pred_bin = (torch.sigmoid(pred) > 0.5).float()
         
-        # 【关键修复】确保 pred_bin 和 gt 的维度完全匹配
         if pred_bin.shape != gt.shape:
-            # 打印维度不匹配信息
             print(f"[WARNING] 维度不匹配: pred_bin.shape={pred_bin.shape}, gt.shape={gt.shape}")
-            # 处理批次维度
             if pred_bin.shape[0] != gt.shape[0]:
                 print(f"[ERROR] 批次维度不匹配: pred_bin={pred_bin.shape[0]}, gt={gt.shape[0]}")
-                # 取最小批次大小
                 min_batch = min(pred_bin.shape[0], gt.shape[0])
                 pred_bin = pred_bin[:min_batch]
                 gt = gt[:min_batch]
-            # 处理通道维度
             if pred_bin.dim() == 4 and pred_bin.shape[1] != gt.shape[1]:
                 if pred_bin.shape[1] > 1 and gt.shape[1] == 1:
                     pred_bin = pred_bin.argmax(dim=1, keepdim=True).float()
                 else:
-                    # 确保通道数一致
                     pred_bin = pred_bin[:, :1]
-            # 处理空间维度
             if pred_bin.shape[2:] != gt.shape[2:]:
                 pred_bin = F.interpolate(pred_bin, size=gt.shape[2:], mode='bilinear', align_corners=False)
         
-        # 【关键修复】确保 pred_bin 和 gt 都是二进制的（0或1）
         pred_bin = torch.clamp(pred_bin, 0, 1)
         gt = torch.clamp(gt, 0, 1)
         
-        # 计算交集和并集
-        inter = (pred_bin * gt).sum(dim=(1, 2, 3))  # 每个样本的交集
-        pred_sum = pred_bin.sum(dim=(1, 2, 3))  # 每个样本的预测前景
-        gt_sum = gt.sum(dim=(1, 2, 3))  # 每个样本的真实前景
-        union = pred_sum + gt_sum - inter  # 每个样本的并集（正确计算）
+        inter = (pred_bin * gt).sum(dim=(1, 2, 3))  
+        pred_sum = pred_bin.sum(dim=(1, 2, 3))  
+        gt_sum = gt.sum(dim=(1, 2, 3))  
+        union = pred_sum + gt_sum - inter  
         
-        # 【关键修复】确保 union 不为零，避免除零错误
         union = torch.clamp(union, min=1e-6)
         
-        # 计算 Dice
         dice = (2 * inter + 1e-6) / (union + 1e-6)
         
-        # 【调试】检查异常值
         if torch.isnan(dice).any() or (dice > 1.0).any() or (dice < 0).any():
             print(f"[WARNING] Dice异常: dice={dice}")
             print(f"[DEBUG] inter={inter}, pred_sum={pred_sum}, gt_sum={gt_sum}, union={union}")
-            # 强制限制在合理范围内
             dice = torch.clamp(dice, 0.0, 1.0)
         
-        return dice  # 返回每个样本的 Dice 张量
-
+        return dice  
     def _calc_tci(self, pred, target):
         """修复后的时序一致性指标（与Dice计算逻辑一致）"""
-        # 【关键修复】确保 pred 和 target 尺寸匹配
         if pred.shape[2:] != target.shape[2:]:
             pred = F.interpolate(pred, size=target.shape[2:], mode='bilinear', align_corners=False)
-        # 【关键修复】确保 target 是 float 类型且是二进制格式
         if target.dtype == torch.long:
             target = target.float()
         
-        # 如果 target 有多个通道（二值分割通常是1通道），取第一个通道或转为二进制
         if target.dim() == 4 and target.shape[1] > 1:
-            # 多类分割，转为背景/前景
             target = (target.argmax(dim=1, keepdim=True) > 0).float()
         elif target.dim() == 4 and target.shape[1] == 1:
             target = (target > 0).float()
         
         pred_bin = (torch.sigmoid(pred) > 0.5).float()
         target_bin = target.float()
-        inter = (pred_bin * target_bin).sum(dim=(1, 2, 3))  # 每个样本的交集
-        union = pred_bin.sum(dim=(1, 2, 3)) + target_bin.sum(dim=(1, 2, 3)) - inter  # 每个样本的并集（正确计算）
-        iou = (inter + 1e-6) / (union + 1e-6)  # 每个样本的 IoU
+        inter = (pred_bin * target_bin).sum(dim=(1, 2, 3))  
+        union = pred_bin.sum(dim=(1, 2, 3)) + target_bin.sum(dim=(1, 2, 3)) - inter  
+        iou = (inter + 1e-6) / (union + 1e-6)  
         
-        # 【关键修复】检查异常值
         if torch.isnan(iou).any() or (iou > 1.0).any():
             print(f"[WARNING] IoU异常: iou={iou}, pred_bin sum={pred_bin.sum()}, target_bin sum={target_bin.sum()}")
             iou = torch.clamp(iou, 0.0, 1.0)
         
-        return iou  # 返回每个样本的 IoU 张量
+        return iou  
     
-    def criterion(self, outputs, labels, interaction_round, previous_pred=None, global_epoch=0):
+    def criterion(self, outputs, labels, interaction_round, previous_pred=None, global_epoch=0, new_click_coords=None):
         """计算损失函数（修复版：不使用self.previous_pred避免计算图累积）
         
         Args:
@@ -1806,34 +1463,33 @@ class TemporalTrainer(BaseTrainer):
             interaction_round: 交互轮次
             previous_pred: 上一轮预测
             global_epoch: 当前全局epoch
+            new_click_coords: 当前轮新增点击坐标 (B, N, 2)
             
         Returns:
             loss: 计算的损失值
         """
-        # 从输出中获取预测掩码和IoU预测
         pred_masks = outputs['masks']
         iou_pred = outputs.get('iou_pred', None)
         
-        # 确保 pred_masks 有梯度信息
         if not pred_masks.requires_grad:
-            # 检查是否在训练模式
             if self.model.training:
-                # 在训练模式下，尝试创建一个有梯度的版本
                 pred_masks = pred_masks.clone().requires_grad_(True)
                 logger.warning("[WARNING] pred_masks had no gradient, created a clone with requires_grad=True")
             else:
-                # 在评估模式下，这是正常的
                 pass
         
-        # 使用 TemporalAwareLoss 作为总损失，它已经包含了主损失和辅助损失
         if hasattr(self, 'temporal_loss'):
-            # 【关键修复2】直接使用传入的previous_pred，而不是self.previous_pred
-            loss = self.temporal_loss(pred_masks, labels.float(), previous_pred, interaction_round, global_epoch)
+            loss = self.temporal_loss(pred_masks, labels.float(),
+                                      iou_pred=iou_pred,
+                                      previous_pred=previous_pred,
+                                      interaction_round=interaction_round,
+                                      global_epoch=global_epoch,
+                                      new_click_coords=new_click_coords,
+                                      image_size=(self.args.image_size, self.args.image_size),
+                                      click_exclude_radius=5)
         else:
-            # 回退到 BCE 损失
             loss = F.binary_cross_entropy_with_logits(pred_masks, labels.float())
         
-        # 【关键修复3】不再在这里设置self.previous_pred，避免计算图保留
         return loss
     
     def _save_checkpoint(self, epoch, state_dict, loss, dice, iou):
@@ -1847,10 +1503,8 @@ class TemporalTrainer(BaseTrainer):
             iou: IoU系数
         """
         try:
-            # 确保保存目录存在
             os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
             
-            # 构建检查点字典
             checkpoint = {
                 'model_state_dict': state_dict,
                 'epoch': epoch,
@@ -1861,11 +1515,9 @@ class TemporalTrainer(BaseTrainer):
                 'lr_scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None
             }
             
-            # 保存最新模型
             latest_path = os.path.join(MODEL_SAVE_PATH, 'IMIS_latest.pth')
             torch.save(checkpoint, latest_path)
             
-            # 保存最佳模型
             if dice > self.best_dice:
                 self.best_dice = dice
                 best_path = os.path.join(MODEL_SAVE_PATH, f'IMIS_best_dice_{dice:.4f}.pth')
@@ -1881,23 +1533,18 @@ class TemporalTrainer(BaseTrainer):
         Args:
             epoch: 当前轮次
         """
-        # 简化实现，实际项目中可能需要更复杂的绘图逻辑
         pass
     
     def _save_metrics_to_csv(self):
         """保存指标到CSV文件
         """
-        # 简化实现，实际项目中可能需要更复杂的保存逻辑
         pass
     
     def train_one_epoch(self, epoch):
-        # ================= 1. 初始化与设备对齐 =================
         self.model.train()
         model = self.model.module if self.args.multi_gpu else self.model
         device = next(model.parameters()).device
         
-        # 同步交互轮次 - 实现课程学习策略
-        # 前50个epoch用3轮交互，后面增加到5轮
         if epoch < 50:
             self.interaction_rounds = 3
         else:
@@ -1906,62 +1553,44 @@ class TemporalTrainer(BaseTrainer):
         if not hasattr(self, 'scaler'):
             self.scaler = torch.cuda.amp.GradScaler()
             
-        # 确保使用正确的训练数据加载器
         self.train_loader = self.dataloaders if not isinstance(self.dataloaders, dict) else self.dataloaders.get('train', self.dataloaders)
         tbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
         epoch_loss, epoch_dice, epoch_iou = 0.0, 0.0, 0.0
         num_steps = len(tbar)
         
-        # 梯度累积设置
-        accumulation_steps = 4  # 每4个batch累积一次梯度
-        step_counter = 0  # 用于跟踪梯度累积的步数
+        accumulation_steps = 4  
+        step_counter = 0  
         
-        # ================= 2. 第10个epoch开始时清空历史记录 =================
         if epoch == 10:
             target_model = self.model.module if hasattr(self.model, 'module') else self.model
             if hasattr(target_model, 'temporal_memory'):
                 target_model.temporal_memory.clear_all_history()
                 logger.info("[时序融合] 第10个epoch开始，清空此前积累的低质量历史记录")
         
-        # ================= 3. 动态调整融合权重 =================
         target_model = self.model.module if hasattr(self.model, 'module') else self.model
         if hasattr(target_model, 'multiscale_temporal_fusion') and hasattr(target_model.multiscale_temporal_fusion, 'update_fusion_weight'):
             fusion_weight = target_model.multiscale_temporal_fusion.update_fusion_weight(epoch)
             logger.info(f"[时序融合] 当前融合权重: {fusion_weight:.4f}")
-
-        # ✅ 新增：用于跟踪病人切换的变量
         last_patient_id = None
-
-        # ================= 2. 核心多轮交互循环 =================
         for step, batch in enumerate(tbar):
-            # ... (保留原有的打印和数据获取逻辑)
             
-            # ✅ 新增：最核心的逻辑！如果换病人了，必须清空上一个病人的记忆！
-            # 注意：一个batch可能包含多个病人，所以需要检查所有病人ID
             batch_patient_ids = set([str(pid) for pid in batch['patient_ids']])
             
-            # 只在batch中所有病人都与上一个batch的病人不同时才清空历史
-            # 这样可以保持同一个病人在多个batch中的历史连续性
             if last_patient_id is not None and not any(pid == last_patient_id for pid in batch_patient_ids):
-                # 清空所有之前病人的历史
                 for pid in batch_patient_ids:
                     if hasattr(self.model.module if hasattr(self.model, 'module') else self.model, 'temporal_memory'):
                         (self.model.module if hasattr(self.model, 'module') else self.model).temporal_memory.clear_patient_history(pid)
                 logger.info(f"[INFO] 切换到新病人组 {batch_patient_ids}，已清空之前病人的历史时序记忆！")
-                # 【关键修复】同时清空 interaction_history，防止显存泄漏
                 if hasattr(self.model.module if hasattr(self.model, 'module') else self.model, 'interaction_history'):
                     (self.model.module if hasattr(self.model, 'module') else self.model).interaction_history.clear()
                     logger.info(f"[INFO] 已清空 interaction_history 防止显存泄漏！")
             
-            # 更新最后处理的病人ID（使用当前batch的第一个病人）
             last_patient_id = str(batch['patient_ids'][0])
             
-            # 打印 batch 开始信息
-            if step % 10 == 0:  # 每10个batch打印一次
+            if step % 10 == 0:  
                 logger.info(f"[INFO] Batch {step+1}/{num_steps}")
             
-            # 【显存管理】每3个batch清理一次显存，防止OOM
-            if step % 3 == 0:  # 从5改为3
+            if step % 3 == 0:  
                 torch.cuda.empty_cache()
                 gc.collect()
             
@@ -1971,103 +1600,63 @@ class TemporalTrainer(BaseTrainer):
             labels = batch["label"].to(device).long()
             batch_size = images.size(0)
             
-            # 【强制从batch获取，没有就报错】
             if 'patient_ids' not in batch or not batch['patient_ids']:
                 raise RuntimeError("Batch中没有patient_ids！请先完成data_loader.py的修改")
             patient_ids = [str(pid) for pid in batch['patient_ids']]
-
             if 'target_list' not in batch or not batch['target_list']:
                 raise RuntimeError("Batch中没有target_list！请先完成data_loader.py的修改")
             
-            # 【调试】打印 target_list 相关信息
             target_list_len = len(batch['target_list'])
             logger.debug(f"[DEBUG target_list] 长度: {target_list_len}, batch_size: {batch_size}, mask_num: {self.args.mask_num}")
             logger.debug(f"[DEBUG target_list] 内容: {batch['target_list']}")
             
-            # 【修复】使用更安全的方式构建 categories
             categories = []
             if target_list_len > 0:
-                # 为每个样本分配一个类别
                 for i in range(len(patient_ids)):
-                    # 确保索引不超出范围
                     idx = min(i, target_list_len - 1)
                     categories.append(batch['target_list'][idx])
             else:
-                # 如果 target_list 为空，使用默认类别
                 categories = [0] * len(patient_ids)
                 print("[WARNING] target_list 为空，使用默认类别 0")
-
             print(f"[DEBUG 数据] 真实病人ID: {patient_ids}, 真实类别: {categories}")
             logger.debug(f"[DEBUG 数据] patient_ids长度: {len(patient_ids)}, categories长度: {len(categories)}")
             
-            # 在每个 batch 开始前，先记录一下当前 batch 有哪些病人
             current_patients_in_batch = set(str(pid) for pid in patient_ids)
-
-            # 【调试】打印batch的基本信息
             logger.info(f"[DEBUG] Batch info: images shape: {images.shape}, labels shape: {labels.shape}, labels unique: {labels.unique().tolist()}")
             logger.info(f"[DEBUG] args.classes: {getattr(self.args, 'classes', None)}")
             logger.info(f"[DEBUG] target_list: {getattr(self, 'target_list', None)}")
-
-            # 注意：不再在批次开始前清空历史记录，避免时序模块失效
-
-            # 初始化损失和变量
-            total_loss = 0.0 # 使用浮点数初始化
+            total_loss = 0.0 
             num_interactions = self.interaction_rounds
             previous_pred = None
             round_loss = 0.0
             image_features = None
-            # ========= 关键修复：在交互循环外初始化累加器 =========
             accumulated_points = None
             accumulated_labels = None
-
-            # ③ 前向传播
-            # 获取真实的模型对象（处理 DDP 包装）
             real_model = self.model.module if hasattr(self.model, 'module') else self.model
-
-            # 【核心修复】构建 Batch 级别的 Prompts，不再硬编码 [0]
-            # 先提取图像特征（只在第一轮提取，避免重复计算）
             if image_features is None and hasattr(self.model, 'image_forward'):
                 image_features = self.model.image_forward(images)
-
-            # 处理 categories
-            # 确保 categories 的长度与扩展后的 batch size 相同
             extended_batch_size = image_features.shape[0]
             if not categories:
                 categories = ["default"] * extended_batch_size
             elif isinstance(categories, (list, tuple)):
                 if len(categories) != extended_batch_size:
-                    # 如果长度不匹配，扩展 categories
-                    # 重复原始 categories 到所需长度
                     extended_categories = []
                     for cat in categories:
                         extended_categories.extend([cat] * self.args.mask_num)
-                    # 确保长度正确
                     extended_categories = extended_categories[:extended_batch_size]
                     categories = extended_categories
             else:
-                # 如果是标量，复制到扩展后的 batch size 长度
                 categories = [str(categories)] * extended_batch_size
-
-            # 确保 patient_ids 的长度与扩展后的 batch size 相同
             if not patient_ids:
-                # 如果为空，生成默认ID
                 patient_ids = [f"patient_{i}" for i in range(extended_batch_size)]
             elif len(patient_ids) != extended_batch_size:
-                # 如果长度不匹配，扩展 patient_ids
-                # 重复原始 patient_ids 到所需长度
                 extended_patient_ids = []
                 for pid in patient_ids:
                     extended_patient_ids.extend([pid] * self.args.mask_num)
-                # 确保长度正确
                 extended_patient_ids = extended_patient_ids[:extended_batch_size]
                 patient_ids = extended_patient_ids
-
-            # 【多类别支持】如果labels是多类别格式，需要转换为二值mask用于loss计算
-            # BTCV有13个器官类别，labels可能是[N, C, H, W]格式的one-hot
-            # 这个转换需要在categories构建之后进行
             original_labels = labels
             if labels.dim() == 4 and labels.shape[1] > 1:
-                # 根据categories中指定的类别提取二值mask
                 binary_labels = []
                 for i in range(labels.shape[0]):
                     if i < len(categories):
@@ -2091,26 +1680,18 @@ class TemporalTrainer(BaseTrainer):
                     labels = (labels.argmax(dim=1, keepdim=True) > 0).float()
             elif labels.dim() == 3:
                 labels = labels.unsqueeze(0)
-
-            # 🔁 多轮交互前向传播
             for interaction_round in range(num_interactions):
-                # ① 检索时序上下文 - 现在在模型内部处理，这里不再需要
-
-                # ② 生成点击点 (使用点击模拟逻辑)
                 points, point_labels = self._simulate_clicks(images, labels, previous_pred, interaction_round)
-
-                # ✅ 修复：累积点击点
                 if accumulated_points is None:
                     accumulated_points = points
                     accumulated_labels = point_labels
                 else:
                     accumulated_points = torch.cat([accumulated_points, points], dim=1)
                     accumulated_labels = torch.cat([accumulated_labels, point_labels], dim=1)
-
                 prompts = {
-                    'patient_ids': patient_ids,   # ✅ 修复：直接使用真实的 patient_ids
+                    'patient_ids': patient_ids,   
                     'categories': categories,     
-                    'interaction_ids': patient_ids, # 使用相同的 ID，确保 interaction 历史也正确隔离
+                    'interaction_ids': patient_ids, 
                     'temporal_enabled': True,
                     'labels': labels,
                     'interaction_round': interaction_round,
@@ -2118,30 +1699,20 @@ class TemporalTrainer(BaseTrainer):
                     'global_epoch': epoch
                 }
                 
-                # 【关键修复】在调用模型之前，初始化dice/tci值
-                # 第一轮交互时使用0作为初始值，后续轮次会使用上一轮的值
                 if interaction_round == 0:
                     prompts['dice'] = [0.0] * len(patient_ids)
                     prompts['tci'] = [0.0] * len(patient_ids)
-                # 否则使用上一轮计算出的dice/tci（如果存在的话）
                 
-                # ✅ 修复：使用累积的点击点，避免"点提示失忆症"
-                # 直接使用原始物理坐标，SAM 会在内部自己做归一化
                 prompts['point_coords'] = accumulated_points.float()
                 prompts['point_labels'] = accumulated_labels
-
-                # 【关键】调用 forward_with_features
-                # 将 autocast 仅包裹前向计算部分，保持梯度流
                 with autocast():
                     if hasattr(self.model, 'forward_with_features'):
                         outputs = self.model.forward_with_features(image_features, prompts)
                     else:
-                        # 回退到标准 forward 方法
                         outputs = self.model.forward(images, prompts)
                 
                 try:
-                    # 直接传递完整的outputs，避免提取时丢失梯度信息
-                    loss = self.criterion(outputs['masks'], labels, previous_pred=previous_pred, interaction_round=interaction_round, global_epoch=epoch)
+                    loss = self.criterion(outputs, labels, interaction_round=interaction_round, previous_pred=previous_pred, global_epoch=epoch, new_click_coords=points)
                 except Exception as e:
                     model_logger.error(f"[FATAL] 前向传播错误: {str(e)}")
                     model_logger.error(f"[FATAL] 病人ID: {patient_ids}, 类别: {categories}")
@@ -2152,100 +1723,72 @@ class TemporalTrainer(BaseTrainer):
                         self.model.module.temporal_memory.clear_all_history()
                     raise e
                 
-                # ✅ 致命修复 2：提取后必须强制转换为 float32，杜绝 BCE 和 Focal Loss 的精度溢出！
                 pred_masks = outputs['masks'].float()
-                del outputs  # 立即删除 outputs，释放显存
+                del outputs  
                 
-                # 检查梯度（仅用于调试，稳定后删除）
-                # 确保interaction_round是标量
                 if isinstance(interaction_round, torch.Tensor):
                     interaction_round_val = interaction_round.mean().item() if interaction_round.numel() > 1 else interaction_round.item()
                 else:
                     interaction_round_val = interaction_round
                 if interaction_round_val == 0 and not pred_masks.requires_grad:
                     print("[CRITICAL] Masks have no grad! Check your model's forward path.")
-                # 注意：不再调用 empty_cache()，避免不必要的同步开销
                 
-                # 累加 Loss，后期轮次权重更高
-                weight = 1.0 + (interaction_round / num_interactions) * 0.5
-                # 检查loss是否为NaN/Inf
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.warning(f"[WARNING] 交互轮次 {interaction_round+1} 的loss为NaN/Inf，跳过累加")
                 else:
-                    total_loss += loss * weight
+                    total_loss += loss
                 
-                # 计算 dice 和 tci 值，并添加到 prompts 字典中
                 dice_scores = self._calc_dice(pred_masks, labels)
                 tci_values = self._calc_tci(pred_masks, labels)
                 batch_dice = dice_scores.mean().item()
                 batch_tci = tci_values.mean().item()
                 
-                # 【关键修复】检查batch_dice是否异常
                 if batch_dice > 1.0:
                     print(f"[WARNING] 交互轮次Dice异常: {batch_dice}, 检查计算逻辑")
                     batch_dice = min(batch_dice, 1.0)
                 if batch_tci > 1.0:
                     print(f"[WARNING] 交互轮次TCI异常: {batch_tci}, 检查计算逻辑")
                     batch_tci = min(batch_tci, 1.0)
-                # 打印调试信息
                 if batch_dice == 0:
                     print(f"[DEBUG] Batch dice is 0! pred_masks shape: {pred_masks.shape}, labels shape: {labels.shape}")
                     print(f"[DEBUG] pred_masks min: {pred_masks.min().item()}, max: {pred_masks.max().item()}")
                     print(f"[DEBUG] labels sum: {labels.sum().item()}")
                     print(f"[DEBUG] pred_masks sigmoid sum: {torch.sigmoid(pred_masks).sum().item()}")
-                # 打印当前交互轮次的dice值，查看交互效果
                 print(f"[交互监控] 轮次 {interaction_round+1}/{num_interactions} - Dice: {batch_dice:.4f}, TCI: {batch_tci:.4f}")
-                # 为每个样本设置对应的 dice 和 tci 值，转换为列表
                 prompts['dice'] = dice_scores.tolist()
                 prompts['tci'] = tci_values.tolist()
                 
-                # 【关键】previous_pred只保留detach后的版本，且移到CPU节省显存
                 previous_pred = pred_masks.detach().cpu()
-                # 保存 pred_masks 用于后续计算后再删除
                 final_pred_masks = pred_masks.detach()
                 del pred_masks
-                # 注意：不再调用 empty_cache()，避免不必要的同步开销
-                # 检查loss是否为NaN/Inf
                 if torch.isnan(loss) or torch.isinf(loss):
                     round_loss = 0.0
                     logger.warning(f"[WARNING] 交互轮次 {interaction_round+1} 的loss为NaN/Inf，使用0.0代替")
                 else:
-                    round_loss = loss.item()  # 记录loss后再删除
+                    round_loss = loss.item()  
                 del loss
-                # 注意：不再调用 empty_cache()，避免不必要的同步开销
             
-            # 循环结束后统一反向传播
             if torch.is_tensor(total_loss) and total_loss.requires_grad:
-                # ✅ 致命修复 3：如果总 Loss 已经是 NaN，直接跳过整个 Batch 的参数更新！
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
                     logger.error(
                         f"[FATAL] 当前 Batch 的 Total Loss 为 NaN/Inf! 放弃参数更新，防止模型权重崩溃。"
                     )
                     self.optimizer.zero_grad()
-                    step_counter += 1  # 仍然增加step_counter，避免累积逻辑混乱
+                    step_counter += 1  
                 else:
-                    # 梯度累积
                     step_counter += 1
                     self.scaler.scale(total_loss / num_interactions).backward()
                     
-                    # 每accumulation_steps个batch更新一次参数
                     if step_counter % accumulation_steps == 0:
-                        # 梯度裁剪
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        # 更新参数
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-                        # 清零梯度
                         self.optimizer.zero_grad()
                         
-                        # 打印梯度累积信息
                         logger.info(f"[梯度累积] 完成 {accumulation_steps} 个batch的梯度累积，更新参数")
             
-            # 处理剩余的梯度
             if step_counter % accumulation_steps != 0 and step == num_steps - 1:
-                # 最后一个batch，处理剩余的梯度
-                # 检查是否有有效的梯度
                 has_valid_grad = any(p.grad is not None and not torch.isnan(p.grad).any() and not torch.isinf(p.grad).any() 
                                      for p in self.model.parameters())
                 
@@ -2261,32 +1804,24 @@ class TemporalTrainer(BaseTrainer):
                     logger.warning(f"[WARNING] 剩余梯度包含NaN/Inf，跳过参数更新")
                     self.optimizer.zero_grad()
             
-            # 每10个step打印一次关键参数
-            if step % 10 == 0:  # 每10个step打印一次
+            if step % 10 == 0:  
                 real_model = self.model.module if hasattr(self.model, 'module') else self.model
                 
-                # 1. 打印轨迹融合权重（应该从0.3逐渐增加）
                 fusion_weight = real_model.multiscale_temporal_fusion.trajectory_fusion_weight.item()
                 print(f"[时序监控] 轨迹融合权重: {fusion_weight:.4f}")
                 
-                # 2. 打印LSTM梯度（应该不为0）- 仅在轨迹模块存在时
                 if hasattr(real_model.multiscale_temporal_fusion, 'trajectory_analyzer'):
                     lstm = real_model.multiscale_temporal_fusion.trajectory_analyzer.temporal_memory
                     if hasattr(lstm, 'weight_ih_l0') and lstm.weight_ih_l0.grad is not None:
                         lstm_grad = lstm.weight_ih_l0.grad.abs().mean().item()
                         print(f"[时序监控] LSTM梯度均值: {lstm_grad:.6f}")
                     
-                # 3. 打印多轮交互Dice提升
                 print(f"[时序监控] 第{interaction_round+1}轮Dice: {batch_dice:.4f}")
                 
-
             else:
                 print("[WARNING] Total loss has no grad, skipping optimizer step.")
-                # 【修复】当没有进行梯度缩放时，不要调用scaler.update()
                     
-            # ================= 3. 指标累加 =================
             with torch.no_grad():
-                # 【关键修复】添加调试信息
                 print(f"[DEBUG] final_pred_masks shape: {final_pred_masks.shape}, labels shape: {labels.shape}")
                 print(f"[DEBUG] final_pred_masks min: {final_pred_masks.min().item()}, max: {final_pred_masks.max().item()}")
                 print(f"[DEBUG] labels min: {labels.min().item()}, max: {labels.max().item()}")
@@ -2294,14 +1829,12 @@ class TemporalTrainer(BaseTrainer):
                 dice_scores = self._calc_dice(final_pred_masks, labels)
                 tci_scores = self._calc_tci(final_pred_masks, labels)
                 
-                # 【关键修复】检查dice_scores和tci_scores是否异常
                 print(f"[DEBUG] dice_scores: {dice_scores}")
                 print(f"[DEBUG] tci_scores: {tci_scores}")
                 
                 batch_dice = dice_scores.mean().item()
                 batch_iou = tci_scores.mean().item()
                 
-                # 【关键修复】检查batch_dice和batch_iou是否异常
                 if batch_dice > 1.0:
                     print(f"[WARNING] 批量Dice异常: {batch_dice}, 检查计算逻辑")
                     batch_dice = min(batch_dice, 1.0)
@@ -2309,68 +1842,50 @@ class TemporalTrainer(BaseTrainer):
                     print(f"[WARNING] 批量IoU异常: {batch_iou}, 检查计算逻辑")
                     batch_iou = min(batch_iou, 1.0)
                 
-                # 【关键修复】计算完成后将final_pred_masks移到CPU释放显存
                 final_pred_masks = final_pred_masks.detach().cpu()
                     
             epoch_loss += round_loss
             epoch_dice += batch_dice
             epoch_iou += batch_iou
             
-            # 【关键修复】记录所有交互轮次的Dice值用于更准确的统计
             if not hasattr(self, 'all_interaction_dices'):
                 self.all_interaction_dices = []
             self.all_interaction_dices.append(batch_dice)
             
             tbar.set_postfix(loss=f"{round_loss:.4f}", dice=f"{batch_dice:.4f}")
             
-            # 【关键修复】每个batch结束后清理 interaction_history，防止显存泄漏
             target_model = self.model.module if hasattr(self.model, 'module') else self.model
             if hasattr(target_model, 'interaction_history'):
                 target_model.interaction_history.clear()
             
-            # 【关键修复】显式清理不再需要的变量，防止显存泄漏
             del image_features
             del previous_pred
             del final_pred_masks
             torch.cuda.empty_cache()
             gc.collect()
-
-
-
-
-
-        # ================= 4. Epoch 结束处理 =================
-
         avg_loss = epoch_loss / num_steps
         avg_dice = epoch_dice / num_steps
         avg_iou = epoch_iou / num_steps
         
-        # 【关键修复】检查avg_dice是否异常
         if avg_dice > 1.0:
             print(f"[WARNING] 最后一轮Dice异常: {avg_dice}, 检查计算逻辑")
             avg_dice = min(avg_dice, 1.0)
         
-        # 【关键修复】计算所有交互轮次的平均Dice，反映真实性能
         if hasattr(self, 'all_interaction_dices') and len(self.all_interaction_dices) > 0:
             all_interaction_avg = sum(self.all_interaction_dices) / len(self.all_interaction_dices)
-            # 【关键修复】检查all_interaction_avg是否异常
             if all_interaction_avg > 1.0:
                 print(f"[WARNING] 所有交互轮次Dice异常: {all_interaction_avg}, 检查计算逻辑")
                 all_interaction_avg = min(all_interaction_avg, 1.0)
             logger.info(f"[详细统计] 所有交互轮次平均Dice: {all_interaction_avg:.4f}, 最后一轮平均Dice: {avg_dice:.4f}")
-            avg_dice = all_interaction_avg  # 使用所有轮次的平均值作为最终结果
-            self.all_interaction_dices = []  # 清空下一epoch的统计
+            avg_dice = all_interaction_avg  
+            self.all_interaction_dices = []  
         
-        # 获取不同模块的学习率
-        lr_vit = self.optimizer.param_groups[0]['lr']      # Image Encoder
-        lr_prompt = self.optimizer.param_groups[1]['lr']   # Prompt Encoder
-        lr_decoder = self.optimizer.param_groups[2]['lr']  # Mask Decoder
-        lr_temporal = self.optimizer.param_groups[3]['lr']  # LSTM / 时序模块
+        lr_vit = self.optimizer.param_groups[0]['lr']      
+        lr_prompt = self.optimizer.param_groups[1]['lr']   
+        lr_decoder = self.optimizer.param_groups[2]['lr']  
+        lr_temporal = self.optimizer.param_groups[3]['lr']  
         
-        # 打印 epoch 结束信息（显示所有关键组的学习率）
         logger.info(f"Epoch {epoch+1} 完成 - LR(ViT): {lr_vit:.6f}, LR(Prompt): {lr_prompt:.6f}, LR(Decoder): {lr_decoder:.6f}, LR(时序): {lr_temporal:.6f}, Loss: {avg_loss:.4f}, Dice: {avg_dice:.4f}")
-
-        # 记录历史 & 保存Checkpoint
         if not hasattr(self, 'metrics_history'):
             self.metrics_history = {
                 'loss': [],
@@ -2389,26 +1904,21 @@ class TemporalTrainer(BaseTrainer):
         self._save_metrics_to_csv()
         
         return {'loss': avg_loss, 'dice': avg_dice, 'iou': avg_iou}
-
-
     def validate_one_epoch(self, epoch):
         """验证一个epoch并搜索最优分割阈值"""
         self.model.eval()
         model = self.model.module if self.args.multi_gpu else self.model
         device = next(model.parameters()).device
         
-        # 确保使用正确的验证数据加载器
         if isinstance(self.dataloaders, dict):
             val_loader = self.dataloaders.get('val', self.dataloaders)
         else:
             val_loader = self.dataloaders
         
-        # 搜索最优阈值（每5个epoch搜索一次）
         if epoch % 5 == 0:
             best_threshold = 0.5
             best_dice = 0.0
             
-            # 只遍历一次数据加载器，保存所有预测结果
             all_preds = []
             all_labels = []
             
@@ -2419,7 +1929,6 @@ class TemporalTrainer(BaseTrainer):
                     patient_ids = [str(pid) for pid in batch['patient_ids']]
                     categories = batch['target_list']
                     
-                    # 构建提示字典
                     prompts = {
                         'patient_ids': patient_ids,
                         'categories': categories,
@@ -2430,12 +1939,10 @@ class TemporalTrainer(BaseTrainer):
                         'epoch': epoch
                     }
                     
-                    # 生成点击点
                     points, point_labels = self._simulate_clicks(images, labels, None, 0)
                     prompts['point_coords'] = points.float()
                     prompts['point_labels'] = point_labels
                     
-                    # 前向传播
                     with autocast():
                         if hasattr(self.model, 'forward'):
                             outputs = self.model.forward(images, prompts)
@@ -2446,7 +1953,6 @@ class TemporalTrainer(BaseTrainer):
                     all_preds.append(pred_masks)
                     all_labels.append(labels)
             
-            # 计算所有阈值的Dice
             all_preds = torch.cat(all_preds, dim=0)
             all_labels = torch.cat(all_labels, dim=0)
             
@@ -2463,13 +1969,11 @@ class TemporalTrainer(BaseTrainer):
             
             logger.info(f"[阈值搜索] 最优阈值: {best_threshold}, 对应Dice: {best_dice:.4f}")
             self.best_threshold = best_threshold
-            # 将最优阈值传递给模型
             if hasattr(self.model, 'module'):
                 self.model.module.best_threshold = best_threshold
             else:
                 self.model.best_threshold = best_threshold
         
-        # 使用最优阈值计算最终验证Dice
         total_dice = 0.0
         total_iou = 0.0
         
@@ -2481,7 +1985,6 @@ class TemporalTrainer(BaseTrainer):
                 patient_ids = [str(pid) for pid in batch['patient_ids']]
                 categories = batch['target_list']
                 
-                # 构建提示字典
                 prompts = {
                     'patient_ids': patient_ids,
                     'categories': categories,
@@ -2492,12 +1995,10 @@ class TemporalTrainer(BaseTrainer):
                     'epoch': epoch
                 }
                 
-                # 生成点击点
                 points, point_labels = self._simulate_clicks(images, labels, None, 0)
                 prompts['point_coords'] = points.float()
                 prompts['point_labels'] = point_labels
                 
-                # 前向传播
                 with autocast():
                     if hasattr(self.model, 'forward'):
                         outputs = self.model.forward(images, prompts)
@@ -2506,7 +2007,6 @@ class TemporalTrainer(BaseTrainer):
                 
                 pred_masks = outputs['masks'].float()
                 
-                # 使用最优阈值计算Dice和IoU
                 threshold = getattr(self, 'best_threshold', 0.5)
                 pred_bin = (torch.sigmoid(pred_masks) > threshold).float()
                 inter = (pred_bin * labels).sum(dim=(1, 2, 3))
@@ -2525,25 +2025,18 @@ class TemporalTrainer(BaseTrainer):
         logger.info(f"[验证] Epoch {epoch+1} - Dice: {avg_dice:.4f}, IoU: {avg_iou:.4f}, 阈值: {getattr(self, 'best_threshold', 0.5):.2f}")
         
         return {'dice': avg_dice, 'iou': avg_iou}
-
     def train(self):
-        # ================= 准备训练环境 =================
-        # 只创建目录，不删除旧文件，保留之前的权重文件
         os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
         
-        # 注意：不再调用 torch.cuda.empty_cache()，避免不必要的开销
         
         logger.info("[INFO] 训练环境准备完成，开始训练")
         
-        # Ensure scaler exists
         if not hasattr(self, 'scaler'):
             self.scaler = GradScaler()
             print("scaler initialized in train method")
         
-        # 初始化最优阈值
         self.best_threshold = 0.5
         
-        # 添加epoch级别的进度条
         from tqdm import tqdm
         epoch_tbar = tqdm(range(self.start_epoch, self.args.num_epochs), desc="Training Epochs")
         
@@ -2555,33 +2048,25 @@ class TemporalTrainer(BaseTrainer):
             
             if self.args.multi_gpu:
                 dist.barrier()
-                # 只对有set_epoch方法的采样器调用
                 if hasattr(self.dataloaders.sampler, 'set_epoch'):
                     self.dataloaders.sampler.set_epoch(epoch)
-
-            # 使用新的 train_one_epoch 方法
             metrics = self.train_one_epoch(epoch)
             avg_loss = metrics['loss']
             avg_iou = metrics['iou']
             avg_dice = metrics['dice']
-
             if not self.args.multi_gpu or (self.args.multi_gpu and self.args.rank == 0):
                 self.losses.append(avg_loss)
                 self.ious.append(avg_iou)
                 self.dices.append(avg_dice)
                 
-                # Get current learning rate
                 current_lr = self.optimizer.param_groups[0]['lr']
                 
-                # 打印当前学习率，确保它是平滑下降的
                 print(f"Epoch {epoch} finished. Current Base LR: {current_lr:.8f}")
                 print(f'Epochs: {epoch}, LR: {current_lr}, Loss: {avg_loss:.4f}, IoU: {avg_iou:.4f}, Dice: {avg_dice:.4f}')
                 logger.info(f'Epoch\t {epoch}\t LR\t {current_lr}\t: loss: {avg_loss:.4f}, iou: {avg_iou:.4f}, dice: {avg_dice:.4f}')
                 
-                # 更新epoch进度条
                 epoch_tbar.set_postfix(loss=f"{avg_loss:.4f}", dice=f"{avg_dice:.4f}", lr=f"{current_lr:.6f}")
                 
-                # 添加学习率到 metrics_history
                 if hasattr(self, 'metrics_history'):
                     self.metrics_history['learning_rate'].append(current_lr)
                 elif hasattr(self.model, 'metrics_history'):
@@ -2592,72 +2077,47 @@ class TemporalTrainer(BaseTrainer):
                 else:
                     state_dict = self.model.state_dict()
                 
-                # Save latest checkpoint
                 self._save_direct_checkpoint(epoch, state_dict, describe='latest')
-
-                # Update best metrics and save corresponding checkpoints
                 if avg_loss < self.best_loss: 
                     self.best_loss = avg_loss
-                    # self._save_direct_checkpoint(epoch, state_dict, describe='loss_best')
                 
                 if avg_iou > self.best_iou: 
                     self.best_iou = avg_iou
-                    # self._save_direct_checkpoint(epoch, state_dict, describe='iou_best')
-
-                # Save dice best checkpoint
                 if avg_dice > self.best_dice: 
                     self.best_dice = avg_dice
                     self._save_direct_checkpoint(epoch, state_dict, describe='dice_best')
                     
-                    # 早停机制：如果性能改善，重置计数器
                     self.early_stop_counter = 0
                 else:
-                    # 性能没有改善，增加计数器（前40轮禁止早停）
                     if epoch >= 40:
                         self.early_stop_counter += 1
                         logger.info(f"[早停监控] 性能未改善，早停计数器: {self.early_stop_counter}/{self.early_stop_patience}")
                 
-                # 检查损失值是否异常
                 if math.isnan(avg_loss) or math.isinf(avg_loss):
                     logger.error("[早停触发] 损失值异常，停止训练！")
                     print("[早停触发] 损失值异常，停止训练！")
                     break
                 
-                # 检查 Dice 值是否为 0（模型完全失效）
-                # 【关键修复】前10个epoch不检查Dice值，给模型时间学习
                 if epoch >= 10 and avg_dice < 0.01:
                     logger.error("[早停触发] Dice 值接近 0，模型完全失效，停止训练！")
                     print("[早停触发] Dice 值接近 0，模型完全失效，停止训练！")
                     break
                 
-                # 检查早停条件
                 if epoch >= 40 and self.early_stop_counter >= self.early_stop_patience:
                     if self.args.disable_early_stop:
                         logger.info(f"[早停监控] 已禁用早停，继续训练...")
                         print(f"[早停监控] 已禁用早停，继续训练...")
-                        self.early_stop_counter = 0  # 重置计数器继续训练
-                        # 当早停被禁用时，自动降低学习率以帮助模型继续优化
-                        # 注释掉自动降学习率，避免学习率过小
-                        # for idx, param_group in enumerate(self.optimizer.param_groups):
-                        #     old_lr = param_group['lr']
-                        #     new_lr = old_lr * 0.5  # 降低50%学习率
-                        #     param_group['lr'] = new_lr
-                        #     group_name = param_group.get('name', f'group_{idx}')
-                        #     logger.info(f"[学习率调整] {group_name}: {old_lr:.2e} -> {new_lr:.2e}")
-                        #     print(f"[学习率调整] {group_name}: {old_lr:.2e} -> {new_lr:.2e}")
+                        self.early_stop_counter = 0  
                     else:
                         logger.info(f"[早停触发] 连续 {self.early_stop_patience} 个 epoch 性能未改善，停止训练！")
                         print(f"[早停触发] 连续 {self.early_stop_patience} 个 epoch 性能未改善，停止训练！")
                         break
                 
-                # Record training metrics
                 print(f"Epoch {epoch} Metrics: Loss={avg_loss:.4f}, Dice={avg_dice:.4f}, IoU={avg_iou:.4f}")
                 
-                # ✅ 修复：在这里调用 scheduler.step()，确保每个 Epoch 只更新一次学习率
                 if self.scheduler is not None:
                     self.scheduler.step()
                 
-                # ✅【内存优化】调用on_epoch_end清理过期历史数据
                 if hasattr(self.model, 'module'):
                     if hasattr(self.model.module, 'multiscale_temporal_fusion'):
                         if hasattr(self.model.module.multiscale_temporal_fusion, 'temporal_memory'):
@@ -2667,7 +2127,6 @@ class TemporalTrainer(BaseTrainer):
                         if hasattr(self.model.multiscale_temporal_fusion, 'temporal_memory'):
                             self.model.multiscale_temporal_fusion.temporal_memory.on_epoch_end(epoch)
                 
-                # 打印历史缓冲信息
                 patient_count = 0
                 total_records = 0
                 if hasattr(self.model, 'module'):
@@ -2678,9 +2137,7 @@ class TemporalTrainer(BaseTrainer):
                     total_records = sum(len(v) for val in self.model.multiscale_temporal_fusion.temporal_memory.history_buffer.values() for v in val.values() if isinstance(val, dict))
                 print(f"[INFO] Epoch {epoch} 完成，历史缓冲包含 {patient_count} 个病人，共 {total_records} 条记录")
                 
-
       
-        # Training completion summary
         print("==========================================")
         print(f"Training completed!")
         print(f"Best metrics - Loss: {self.best_loss:.4f}, Dice: {self.best_dice:.4f}, IoU: {self.best_iou:.4f}")
@@ -2688,18 +2145,14 @@ class TemporalTrainer(BaseTrainer):
         print(f"Best threshold: {getattr(self, 'best_threshold', 0.5):.2f}")
         print("==========================================")
 
-
-
-########################################## Trainer ##########################################
 def init_seeds(seed=0, cuda_deterministic=True):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    # Speed-reproducibility tradeoff https://pytorch.org/docs/stable/notes/randomness.html
-    if cuda_deterministic:  # slower, more reproducible
+    if cuda_deterministic:  
         cudnn.deterministic = True
         cudnn.benchmark = False
-    else:  # faster, less reproducible
+    else:  
         cudnn.deterministic = False
         cudnn.benchmark = True
 
@@ -2720,78 +2173,59 @@ def device_config(args):
 def main():
     os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
     os.environ['PYOPENGL_LOG_LEVEL'] = 'ERROR'
-
-    # BTCV 13个器官类别（加背景共14类）
     BTCV_CLASSES = [
         'background', 'spleen', 'right_kidney', 'left_kidney',
         'gallbladder', 'esophagus', 'liver', 'stomach', 'aorta',
         'inferior_vena_cava', 'portal_vein_and_splenic_vein',
         'pancreas', 'right_adrenal_gland', 'left_adrenal_gland'
     ]
-
-    # [新增] AMOS2022 15个器官类别（加背景共16类）
     AMOS_CLASSES = [
         'background', 'spleen', 'right_kidney', 'left_kidney',
         'gallbladder', 'esophagus', 'liver', 'stomach', 'aorta',
         'inferior_vena_cava', 'pancreas', 'right_adrenal_gland',
         'left_adrenal_gland', 'duodenum', 'bladder', 'prostate_uterus'
     ]
-
-    # 任务路由表：根据 task_name 自动配置
     if args.task_name == 'BTCV':
         args.classes = BTCV_CLASSES
-        args.use_temporal_fusion = True  # BTCV 切片间连续，必须开启
-        args.num_classes = 14  # BTCV 有 13 个器官 + 1 个背景
-        # 设置 CT 窗宽窗位 (腹部常用：L=40, W=400 -> 范围约为 -160 到 240)
+        args.use_temporal_fusion = True  
+        args.num_classes = 14  
         args.window_level = 40
         args.window_width = 400
-    # [新增] 针对 AMOS2022_MR 的路由
     elif args.task_name == 'AMOS2022_MR':
         args.classes = AMOS_CLASSES
         args.use_temporal_fusion = True
-        args.num_classes = 16  # AMOS 有 15 个器官 + 1 个背景
-        args.is_mr = True      # 标记为 MR 模态，供 DataLoader 使用
+        args.num_classes = 16  
+        args.is_mr = True      
     elif 'ACDC' in args.task_name.upper():
         args.classes = ['background', 'RV', 'Myo', 'LV']
         args.use_temporal_fusion = True
-        args.num_classes = 4  # ACDC 有 3 个器官 + 1 个背景
-
+        args.num_classes = 4  
     logging.getLogger('cv2').setLevel(logging.WARNING)
     logging.getLogger('PIL').setLevel(logging.WARNING)
     logging.getLogger('matplotlib').setLevel(logging.WARNING)
-
     LOG_OUT_DIR = os.path.join(args.work_dir, args.task_name)
     os.makedirs(LOG_OUT_DIR, exist_ok=True)
     log_file = os.path.join(LOG_OUT_DIR, 'training.log')
-
     print(f"[INIT] 日志文件将保存到: {log_file}", flush=True)
-
     sys.stdout.flush()
     sys.stderr.flush()
-
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
     root_logger.handlers.clear()
-
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.INFO)  # 仅记录 INFO 及以上，减少 DEBUG 日志
+    file_handler.setLevel(logging.INFO)  
     file_handler.setFormatter(logging.Formatter('[%(asctime)s] - [%(levelname)s] - %(message)s', datefmt='%Y/%m/%d %H:%M:%S'))
-
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(logging.Formatter('[%(asctime)s] - [%(levelname)s] - %(message)s', datefmt='%Y/%m/%d %H:%M:%S'))
     console_handler.stream.flush()
-
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
-
     print(f"[TEST] 日志文件路径: {log_file}", flush=True)
     print(f"[TEST] 文件是否存在: {os.path.exists(log_file)}", flush=True)
     file_handler.stream.flush()
     print(f"[TEST] 文件大小: {os.path.getsize(log_file) if os.path.exists(log_file) else 0} bytes", flush=True)
-
     root_logger.info(f"[TEST] 日志系统初始化完成")
-
     print('*'*100)
     for key, value in vars(args).items():
         print(key + ': ' + str(value))
@@ -2805,18 +2239,14 @@ def main():
         np.random.seed(42)
         torch.manual_seed(42)
         init_seeds(42)
-        # Load datasets
         dataloaders = get_loader(args)
-        # Build model
         model = build_model(args)
-        # Create appropriate trainer based on temporal fusion setting
         if args.use_temporal_fusion:
             trainer = TemporalTrainer(model, dataloaders, args)
             print("Using TemporalTrainer for temporal fusion training")
         else:
             trainer = BaseTrainer(model, dataloaders, args)
             print("Using BaseTrainer for standard training")
-        # Train
         trainer.train()
 
 def main_worker(rank, args):
@@ -2826,17 +2256,13 @@ def main_worker(rank, args):
     args.rank = rank
     args.gpu_info = {"gpu_count":args.world_size, 'gpu_name':rank}
     init_seeds(2024 + rank)
-
     log_file = os.path.join(LOG_OUT_DIR, 'training.log')
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.INFO)  # 仅记录 INFO 及以上，减少 DEBUG 日志
+    file_handler.setLevel(logging.INFO)  
     file_handler.setFormatter(logging.Formatter('[%(asctime)s] - [%(levelname)s] - %(message)s', datefmt='%Y/%m/%d %H:%M:%S'))
-
-
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.DEBUG if rank in [-1, 0] else logging.WARN)
     console_handler.setFormatter(logging.Formatter('[%(asctime)s] - [%(levelname)s] - %(message)s', datefmt='%Y/%m/%d %H:%M:%S'))
-
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
     root_logger.handlers.clear()
@@ -2845,7 +2271,6 @@ def main_worker(rank, args):
     
     dataloaders = get_loader(args)
     model = build_model(args)
-    # Create appropriate trainer based on temporal fusion setting
     if args.use_temporal_fusion:
         trainer = TemporalTrainer(model, dataloaders, args)
         if rank == 0:
@@ -2857,16 +2282,13 @@ def main_worker(rank, args):
     trainer.train()
     cleanup()
 
-
 def setup(rank, world_size):
-    # initialize the process group
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = f'{args.port}'
     dist.init_process_group(backend='NCCL', init_method='env://', rank=rank, world_size=world_size)
 
 def cleanup():
     dist.destroy_process_group()
-
 if __name__ == '__main__':
     try:
         main()
