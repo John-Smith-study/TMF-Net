@@ -13,7 +13,7 @@ Please download the checkpoint from the original link and place the downloaded f
 ckpt/
 
 
-## Dataset Splits
+# Dataset Splits
 
 We use the preprocessed datasets released in IMed-361M on HuggingFace:
 
@@ -42,7 +42,7 @@ dataset/
     └── dataset.json
 
 
-## Train TMF-Net
+# Train TMF-Net
 
 To train TMF-Net, run:
 
@@ -56,7 +56,9 @@ sam_checkpoint: path to the downloaded IMISNet-B checkpoint under ckpt/.
 inter_num: number of simulated interaction rounds used during training.
 epochs: number of training epochs. Default: 150.
 batch_size: training batch size. Default: 8.
-Evaluate TMF-Net
+
+
+# Evaluate TMF-Net
 To evaluate TMF-Net, run:
 python test.py
 Main arguments:
@@ -66,7 +68,9 @@ data_path: dataset directory, for example dataset/BTCV.
 checkpoint: path to the trained TMF-Net checkpoint.
 inter_num: number of simulated interaction rounds. The paper reports results with K = 8.
 prompt_mode: interaction mode. The paper uses point-based simulated corrective clicks.
-Evaluation Protocol
+
+
+# Evaluation Protocol
 All reported results use the same 2D slice-level interactive protocol:
 Interaction budget: K = 8
 ACDC: NoC@90%-DSC
