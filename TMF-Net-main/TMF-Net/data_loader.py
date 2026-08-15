@@ -28,6 +28,66 @@ from dataloaders.data_utils import (
 import cv2
 
 
+def _extract_inplane_spacing(item_dict, orig_h, orig_w, resized_h, resized_w):
+    """Extract 2D in-plane physical pixel spacing (y, x) in mm for a single slice.
+
+    Checks common spacing metadata keys in the dataset.json item dict, then
+    adjusts for the image resize that happened during preprocessing:
+        new_spacing_y = original_spacing_y * orig_h / resized_h
+        new_spacing_x = original_spacing_x * orig_w / resized_w
+
+    Args:
+        item_dict:   the per-sample dict from dataset.json (may contain spacing)
+        orig_h/orig_w: original image height/width before resize
+        resized_h/resized_w: image height/width after resize
+
+    Returns:
+        (spacing_y, spacing_x) in mm. Falls back to (1.0, 1.0) with a warning
+        if no spacing metadata is found.
+    """
+    spacing_keys = ['spacing', 'pixdim', 'original_spacing', 'image_spacing',
+                    'pixel_spacing', 'spacing_xy']
+    raw_spacing = None
+    found_key = None
+    for key in spacing_keys:
+        if key in item_dict and item_dict[key] is not None:
+            raw_spacing = item_dict[key]
+            found_key = key
+            break
+
+    if raw_spacing is None:
+        print(f"[WARNING] No spacing metadata found in dataset.json item "
+              f"(image={item_dict.get('image', '?')}). Falling back to (1.0, 1.0) mm.")
+        return (1.0, 1.0)
+
+    # Normalise to a 2-element list [sy, sx]
+    try:
+        if isinstance(raw_spacing, (int, float)):
+            sy, sx = float(raw_spacing), float(raw_spacing)
+        elif isinstance(raw_spacing, (list, tuple, np.ndarray)):
+            arr = list(raw_spacing)
+            # pixdim may have >2 elements [z, y, x, ...]; take last two as in-plane
+            if len(arr) >= 2:
+                sy, sx = float(arr[-2]), float(arr[-1])
+            else:
+                sy = sx = float(arr[0])
+        else:
+            print(f"[WARNING] Unrecognised spacing format ({found_key}={raw_spacing}), "
+                  f"falling back to (1.0, 1.0).")
+            return (1.0, 1.0)
+    except (ValueError, TypeError, IndexError) as e:
+        print(f"[WARNING] Failed to parse spacing ({found_key}={raw_spacing}): {e}, "
+              f"falling back to (1.0, 1.0).")
+        return (1.0, 1.0)
+
+    # Adjust for resize: spacing scales with the ratio of original/resized dims
+    if resized_h > 0 and resized_w > 0:
+        sy = sy * orig_h / resized_h
+        sx = sx * orig_w / resized_w
+
+    return (float(sy), float(sx))
+
+
 class PatientGroupSampler(Sampler):
     def __init__(self, dataset, batch_size):
         self.dataset = dataset
@@ -197,11 +257,20 @@ class UniversalDataset(Dataset):
                 match = re.match(r'(ABD_\d+|amos_\d+)', filename)
                 patient_id = match.group(1) if match else filename.split('_')[0]
 
+                # Record original in-plane dimensions (before resize) for spacing adjustment
+                orig_h, orig_w = image.shape[:2]
+
                 if self.test_mode:
 
                     item_ori = {'image': image, 'label': label_array}
                     item = self.transform(item_ori)
                     _, H, W = item['image'].shape
+
+                    # Extract per-slice 2D in-plane physical spacing (y, x) in mm,
+                    # adjusted for the resize from (orig_h, orig_w) to (H, W).
+                    item['spacing'] = _extract_inplane_spacing(
+                        item_dict, orig_h, orig_w, H, W
+                    )
 
                     point_coords, point_labels, bboxes = [], [], []
 
@@ -266,6 +335,11 @@ class UniversalDataset(Dataset):
                         continue
 
                     _, H, W = item['image'].shape
+
+                    # Extract per-slice 2D in-plane physical spacing (y, x) in mm.
+                    item['spacing'] = _extract_inplane_spacing(
+                        item_dict, orig_h, orig_w, H, W
+                    )
                     select_pseudo = torch.zeros(self.mask_num, 1, H, W)
 
                     (
@@ -392,7 +466,11 @@ class UniversalDataset(Dataset):
         keys_to_remain = ['image', 'gt', 'ori_gt', 'image_root',
                         'gt_point_coords', 'gt_point_labels', 'gt_bboxes', 'gt_target',
                         'pseudo', 'pseudo_point_coords', 'pseudo_point_labels', 'pseudo_bboxes',
-                        'patient_id', 'image_filename']  # 添加 patient_id 和 image_filename
+                        'patient_id', 'image_filename', 'spacing']
+        keys_to_remove = post_item.keys() - keys_to_remain
+        for key in keys_to_remove:
+            del post_item[key]
+        return post_item
         keys_to_remove = post_item.keys() - keys_to_remain
         for key in keys_to_remove:
             del post_item[key]
@@ -474,6 +552,8 @@ def test_collate_fn(batch):
     patient_id = batch[0]['patient_id']
     num_masks = len(batch[0]['gt_target'])
     patient_ids = [patient_id] * num_masks  # 每个样本对应一个ID
+    # Per-slice 2D in-plane physical spacing (sy, sx) in mm for HD95/ASSD
+    spacing = batch[0].get('spacing', (1.0, 1.0))
     return {
         'image': batch[0]['image'].unsqueeze(0),  # 添加 batch 维度
         'label': batch[0]['gt'],
@@ -482,6 +562,7 @@ def test_collate_fn(batch):
         'target_list': target_list,
         'image_root': image_root,
         'patient_ids': patient_ids,
+        'spacing': spacing,
     }
 
 
@@ -532,7 +613,8 @@ def train_collate_fn(batch):
         'target_list': target_list,
         'gt_prompt': gt_prompt,
         'pseudo_prompt': pseudo_prompt,
-        'patient_ids': patient_ids,  # 现在长度=batch_size=16
+        'patient_ids': patient_ids,
+        'spacing': [s.get('spacing', (1.0, 1.0)) for s in batch],
     }
 
 
