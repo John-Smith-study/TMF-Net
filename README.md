@@ -13,7 +13,7 @@ Please download the checkpoint and place the extracted files under the `ckpt/` d
 ckpt/
 ```
 
-Dataset Splits
+## Dataset Splits
 All experiments in the paper follow a 2D slice-level interactive segmentation protocol. Although ACDC, BTCV, and AMOS2022_MR originate from volumetric medical images, training and evaluation are performed on 2D slices. The reported DSC, HD95, ASSD, NoC, and AUC values are computed directly on 2D slice predictions and macro-averaged across valid target-containing slices. No 3D volume reconstruction is used for metric computation.
 We use the preprocessed ACDC, BTCV, and AMOS2022_MR datasets released in IMed-361M on HuggingFace. The train/test splits are defined by the training and test entries in the dataset.json file included in each corresponding IMed-361M dataset archive.
 The data should be organized following the IMed-361M format:
