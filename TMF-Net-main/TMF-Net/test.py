@@ -1,4 +1,3 @@
-
 # set up environment
 import numpy as np
 import random
@@ -1718,9 +1717,15 @@ class BaseTester:
                 target_list = batch_input['target_list']
                 gt_prompt = batch_input["gt_prompt"]
                 image_root = batch_input["image_root"][0]
+                # Per-slice 2D in-plane physical spacing (sy, sx) in mm from data_loader
+                batch_spacing = batch_input.get('spacing', (1.0, 1.0))
 
                 logger.info(f"[DEBUG] target_list: {target_list}, len: {len(target_list)}")
                 print(f"[DEBUG] Batch {step + 1}: Image root: {image_root}")
+                # Sanity-check log: show spacing used for first few batches
+                if step < 5:
+                    logger.info(f"[SPACING] Batch {step + 1}: {image_root} → "
+                                f"in-plane spacing (sy,sx)={batch_spacing} mm")
 
                 # 验证模型方法存在
                 if not hasattr(model, 'image_forward'):
@@ -2155,7 +2160,9 @@ class BaseTester:
 
                             # HD95 / ASSD: utils.get_hd95_and_assd internally does (pred > 0.5)
                             # which for {0,1}-valued ori_preds is a strict identity -- safe.
-                            spacing = (0.76, 0.76) if self.args.dataset.lower() == 'btcv' else (1.0, 1.0)
+                            # Use per-slice 2D in-plane physical spacing from data_loader
+                            # (replaces former hard-coded dataset-level spacing).
+                            spacing = batch_spacing
                             temp_hd95, temp_assd = get_hd95_and_assd(ori_preds, ori_labels_cls, voxelspacing=spacing)
 
                             # 调试打印：困难样本分析
