@@ -297,14 +297,17 @@ def _compute_distances(points1, points2):
 def get_hd95_and_assd(pred, label, voxelspacing=None):
     """
     计算 HD95 和 ASSD 指标（不依赖 medpy）。
-    
+
     参数:
         pred: 预测掩码，形状为 [B, C, H, W] 或 [B, H, W] 或 [H, W] (Tensor 或 Numpy)
         label: 真实标签，形状同上
-        voxelspacing: 物理像素间距，例如 (1.0, 1.0) 或者是 (1.25, 1.25)。用于将像素转换为毫米(mm)
-        
+        voxelspacing: 2D in-plane physical pixel spacing (sy, sx) in mm.
+                      Used to scale surface-point coordinates BEFORE distance
+                      computation so that anisotropic pixels are handled
+                      correctly (not via mean-spacing post-multiplication).
+
     返回:
-        hd95_mean, assd_mean (均值)
+        hd95_mean, assd_mean (均值, in mm)
     """
     # 1. 转换为 numpy 数组
     if torch.is_tensor(pred):
@@ -326,44 +329,46 @@ def get_hd95_and_assd(pred, label, voxelspacing=None):
         # 返回 NaN，在求均值时将其过滤，这是 2D 切片评估的标准做法
         return np.nan, np.nan
 
-    # 4. 提取表面点
+    # 4. 提取表面点 (pixel coordinates, (x, y) format)
     pred_surface = _get_surface_points(pred_binary)
     label_surface = _get_surface_points(label_binary)
-    
+
     if len(pred_surface) == 0 or len(label_surface) == 0:
         return np.nan, np.nan
 
-    # 5. 计算距离矩阵
+    # 5. Scale surface-point coordinates by per-axis physical spacing BEFORE
+    #    distance computation. This correctly handles anisotropic pixels:
+    #    _get_surface_points returns (x, y), so we multiply x by sx and y by sy.
+    #    Do NOT use mean(spacing) post-multiplication — that is only correct
+    #    for isotropic pixels.
+    if voxelspacing is not None:
+        sy, sx = float(voxelspacing[0]), float(voxelspacing[1])
+        scale = np.array([sx, sy], dtype=np.float64)  # [x_scale, y_scale]
+        pred_surface = pred_surface * scale
+        label_surface = label_surface * scale
+
+    # 6. 计算距离矩阵 (now in mm)
     dist_pred_to_label = _compute_distances(pred_surface, label_surface)
     dist_label_to_pred = _compute_distances(label_surface, pred_surface)
-    
+
     if dist_pred_to_label.size == 0 or dist_label_to_pred.size == 0:
         return np.nan, np.nan
 
-    # 6. 计算 HD95
-    # HD95 是双向最大距离的 95% 分位数
+    # 7. 计算 HD95 (in mm)
     all_distances = np.concatenate([
-        dist_pred_to_label.min(axis=1),  # 从 pred 到 label 的最小距离
-        dist_label_to_pred.min(axis=1)   # 从 label 到 pred 的最小距离
+        dist_pred_to_label.min(axis=1),
+        dist_label_to_pred.min(axis=1)
     ])
-    
+
     if len(all_distances) == 0:
         hd95 = np.nan
     else:
         hd95 = np.percentile(all_distances, 95)
 
-    # 7. 计算 ASSD（平均对称表面距离）
-    # ASSD = (mean(pred->label最小距离) + mean(label->pred最小距离)) / 2
+    # 8. 计算 ASSD (in mm)
     mean_pred_to_label = np.mean(dist_pred_to_label.min(axis=1))
     mean_label_to_pred = np.mean(dist_label_to_pred.min(axis=1))
     assd = (mean_pred_to_label + mean_label_to_pred) / 2.0
-
-    # 8. 应用像素间距缩放
-    if voxelspacing is not None:
-        # 假设 voxelspacing 是 (x_spacing, y_spacing)
-        spacing_factor = np.mean(voxelspacing)
-        hd95 *= spacing_factor
-        assd *= spacing_factor
 
     return float(hd95), float(assd)
 
