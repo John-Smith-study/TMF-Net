@@ -64,7 +64,7 @@ Main arguments:
 To evaluate TMF-Net with the paper setting, run:
 
 ```bash
-python test.py --test_mode True --data_dir dataset/BTCV --sam_checkpoint ckpt/IMISNet-B.pth --pretrain_path work_dir/BTCV_traj/TMF_latest.pth --inter_num 8
+python test.py --test_mode True --data_dir dataset/BTCV --sam_checkpoint ckpt/IMISNet-B.pth --pretrain_path work_dir/ --inter_num 8
 ```
 
 Main arguments:
