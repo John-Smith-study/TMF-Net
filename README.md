@@ -11,7 +11,7 @@ Please download the checkpoint and place the extracted files under the `ckpt/` d
 
 ```text
 ckpt/
-...
+```
 
 Dataset Splits
 All experiments in the paper follow a 2D slice-level interactive segmentation protocol. Although ACDC, BTCV, and AMOS2022_MR originate from volumetric medical images, training and evaluation are performed on 2D slices. The reported DSC, HD95, ASSD, NoC, and AUC values are computed directly on 2D slice predictions and macro-averaged across valid target-containing slices. No 3D volume reconstruction is used for metric computation.
