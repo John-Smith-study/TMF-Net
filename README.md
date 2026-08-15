@@ -17,7 +17,7 @@ ckpt/
 
 All experiments in the paper follow a 2D slice-level interactive segmentation protocol. Although ACDC, BTCV, and AMOS2022_MR originate from volumetric medical images, training and evaluation are performed on 2D slices. The reported DSC, HD95, ASSD, NoC, and AUC values are computed directly on 2D slice predictions and macro-averaged across valid target-containing slices. No 3D volume reconstruction is used for metric computation.
 
-We use the preprocessed ACDC, BTCV, and AMOS2022_MR datasets released in IMIS-361M on HuggingFace: [General-Medical-AI/IMed-361M](https://huggingface.co/datasets/General-Medical-AI/IMed-361M/tree/main). The train/test splits are defined by the `training` and `test` entries in the `dataset.json` file included in each corresponding IMIS-361M dataset archive.
+We use the preprocessed ACDC, BTCV, and AMOS2022_MR datasets released in IMIS-361M on HuggingFace: [General-Medical-AI/IMIS-361M](https://huggingface.co/datasets/General-Medical-AI/IMed-361M/tree/main). The train/test splits are defined by the `training` and `test` entries in the `dataset.json` file included in each corresponding IMIS-361M dataset archive.
 
 The data should be organized following the IMed-361M format:
 
@@ -64,7 +64,7 @@ Main arguments:
 To evaluate TMF-Net with the paper setting, run:
 
 ```bash
-python test.py --test_mode True --data_dir dataset/BTCV --sam_checkpoint ckpt/IMISNet-B.pth --pretrain_path work_dir/ --inter_num 8
+python test.py  --test_mode True  --data_dir dataset/BTCV  --sam_checkpoint ckpt/IMISNet-B.pth  --pretrain_path work_dir/   --inter_num 8
 ```
 
 Main arguments:
