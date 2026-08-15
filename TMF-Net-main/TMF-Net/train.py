@@ -1,4 +1,3 @@
-
 import sys
 import numpy as np
 import random 
@@ -51,7 +50,7 @@ parser.add_argument('--dataset', type=str, default='acdc', help='Dataset type: a
 parser.add_argument("--data_dir", type = str, default='dataset/ACDC')
 parser.add_argument('--image_size', type=int, default=256)
 parser.add_argument('--test_mode', type=bool, default=False)
-parser.add_argument('--batch_size', type=int, default=16)
+parser.add_argument('--batch_size', type=int, default=8)
 parser.add_argument('--model_type', type=str, default='vit_b')
 parser.add_argument('--sam_checkpoint', type=str, default='ckpt/IMISNet-B.pth')
 parser.add_argument('--pretrain_path', type=str, default='work_dir/ACDC_traj/IMIS_latest.pth')
@@ -63,16 +62,16 @@ parser.add_argument('--use_temporal_fusion', action='store_true', default=True, 
 parser.add_argument('--temporal_interactions', type=int, default=3, help='Number of interaction rounds for temporal fusion')
 parser.add_argument('--ablation_no_multi_scale', action='store_true', default=False, help='Ablation study: disable multi-scale feature fusion')
 parser.add_argument('--ablation_no_trajectory', action='store_true', default=False, help='Ablation study: disable LSTM trajectory analysis')
-parser.add_argument('--num_epochs', type=int, default=500)
-parser.add_argument('--lr_scheduler', type=str, default=None)
+parser.add_argument('--num_epochs', type=int, default=150)
+parser.add_argument('--lr_scheduler', type=str, default='cosine')
 parser.add_argument('--early_stop_patience', type=int, default=50, help='Early stop patience')
 parser.add_argument('--disable_early_stop', action='store_true', default=False, help='Disable early stopping completely')
 parser.add_argument('--lr_restart', type=float, default=None, help='Restart learning rate (for continue training)')
 parser.add_argument('--continue_from_best', action='store_true', default=False, help='Continue training from best checkpoint')
 parser.add_argument('--step_size', type=list, default=[7,12]) 
 parser.add_argument('--gamma', type=float, default=0.5)
-parser.add_argument('--lr', type=float, default=5e-7)
-parser.add_argument('--weight_decay', type=float, default=1e-5)
+parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--weight_decay', type=float, default=1e-2)
 parser.add_argument('--port', type=int, default=12305)
 parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0])
 parser.add_argument('--multi_gpu', action='store_true', default=False)
@@ -343,40 +342,62 @@ class BaseTrainer:
         else:
             self.criterion = FocalDice_MSELoss()
     def build_optimizer(self):
-        param_groups = [
-            {'params': [], 'lr': 5e-5, 'weight_decay': 1e-4},  
-            
-            {'params': [], 'lr': 5e-4, 'weight_decay': 1e-4},  
-            {'params': [], 'lr': 5e-4, 'weight_decay': 1e-4},  
-            
-            {'params': [], 'lr': 2e-4, 'weight_decay': 1e-4},  
-            
-            {'params': [], 'lr': 1e-3, 'weight_decay': 0.0},   
-        ]
-        
+        # Paper training recipe (default CLI args):
+        #   Epochs = 150, batch = 8, optimizer = AdamW, base_lr = 1e-4,
+        #   weight_decay = 1e-2, lr schedule = cosine annealing down to 1e-6.
+        #
+        # Per-module group assignment is preserved (image-encoder top blocks,
+        # prompt encoder, mask decoder + temporal/LSTM, special fusion scalars,
+        # and bias/batchnorm without weight decay). Group LR ratios are kept
+        # proportional to the original design but now anchored on args.lr so
+        # the user-specified (or paper-default) 1e-4 propagates consistently.
+        base_lr = float(self.args.lr)
+        base_wd = float(self.args.weight_decay)
+
+        # group 0: image_encoder top blocks (frozen-ish low lr)
+        # group 1: prompt_encoder + misc params
+        # group 2: mask_decoder + temporal/LSTM/trajectory/fusion params
+        # group 3: explicit scalar fusion weights
+        # group 4: bias / LayerNorm params (0 weight decay, paper-standard)
+        lr_scales = [0.5, 1.0, 1.0, 1.0, 1.0]
+        wd_scales = [1.0, 1.0, 1.0, 1.0, 0.0]
+        param_groups = []
+        for lr_s, wd_s in zip(lr_scales, wd_scales):
+            param_groups.append({
+                'params': [],
+                'lr': base_lr * lr_s,
+                'weight_decay': base_wd * wd_s,
+            })
+
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'trajectory_fusion_weight' in name or 'fusion_weights' in name:
-                param_groups[3]['params'].append(param)
-                logger.debug(f"[DEBUG 优化器] 特殊权重参数: {name} 分配 LR: 1e-4")
+            # LayerNorm / GroupNorm / bias -> no weight-decay group (group 4)
+            if name.endswith('.bias') or 'norm.' in name or '.bn.' in name or '.ln.' in name or name.endswith('.weight') and ('norm' in name or 'batchnorm' in name or 'layernorm' in name):
+                target_group = 4
+            elif 'trajectory_fusion_weight' in name or 'fusion_weights' in name:
+                target_group = 3
             elif 'image_encoder' in name:
                 if ('blocks.11' in name or 'blocks.10' in name or 'blocks.9' in name or 'neck' in name):
-                    param_groups[0]['params'].append(param)
+                    target_group = 0
                 else:
-                    param.requires_grad = False  
+                    param.requires_grad = False
+                    continue
             elif 'prompt_encoder' in name:
-                param_groups[1]['params'].append(param)
+                target_group = 1
             elif 'mask_decoder' in name:
-                param_groups[2]['params'].append(param)
+                target_group = 2
             elif 'temporal' in name or 'lstm' in name or 'trajectory' in name or 'fusion' in name:
-                param_groups[2]['params'].append(param)
-                logger.debug(f"[DEBUG 优化器] 添加时序参数: {name} 分配 LR: 5e-5")
+                target_group = 2
             else:
-                param_groups[1]['params'].append(param)
-        
+                target_group = 1
+            param_groups[target_group]['params'].append(param)
+
         for i, group in enumerate(param_groups):
-            logger.debug(f"[DEBUG 优化器] 参数组 {i} 大小: {len(group['params'])}，学习率: {group['lr']}")
+            logger.debug(
+                f"[DEBUG Optimizer] Group {i}: n={len(group['params'])}, "
+                f"lr={group['lr']:.3e}, weight_decay={group['weight_decay']:.3e}"
+            )
         self.optimizer = torch.optim.AdamW(param_groups)
         self.scheduler = None
         if self.args.lr_scheduler == 'cosine':
@@ -402,19 +423,24 @@ class BaseTrainer:
             self.scheduler = None
         else:
             warmup_epochs = 5
-            def warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs, min_lr=1e-5):
+            # User-selected non-standard scheduler. Match the paper cosine end-lr:
+            # cosine from peak LR down to 1e-6 (so the min ratio is 1e-6 / base_lr
+            # rather than the hard-coded 1e-5 / 1e-3 which mismatched defaults).
+            base_lr = float(self.args.lr)
+            min_lr_ratio = (1e-6 / base_lr) if base_lr > 0 else 0.0
+            def warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs, min_lr_ratio):
                 def lr_lambda(epoch):
                     if epoch < warmup_epochs:
                         return (epoch + 1) / warmup_epochs
                     else:
-                        progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-                        return max(0.5 * (1 + math.cos(math.pi * progress)), min_lr / 1e-3)
+                        progress = (epoch - warmup_epochs) / max(1, (total_epochs - warmup_epochs))
+                        return max(0.5 * (1.0 + math.cos(math.pi * progress)), min_lr_ratio)
                 return LambdaLR(optimizer, lr_lambda)
             self.scheduler = warmup_cosine_scheduler(
                 self.optimizer,
                 warmup_epochs=warmup_epochs,
                 total_epochs=self.args.num_epochs,
-                min_lr=1e-5
+                min_lr_ratio=min_lr_ratio,
             )
         self.warmup_epochs = 0
         
