@@ -55,9 +55,7 @@ parser.add_argument('--device', type=str, default='cuda')
 parser.add_argument('--mask_num', type=int, default=None)
 parser.add_argument('--prompt_mode', type=str, default='points')
 parser.add_argument('--inter_num', type=int, default=8, help='交互轮数，增加可提升性能但会减慢测试速度')
-parser.add_argument('--use_temporal_fusion', action='store_true', default=True, help='启用时序融合测试')
-parser.add_argument('--evaluate_temporal_performance', action='store_true', default=False, help='评估时序性能')
-parser.add_argument('--best_threshold', action='store_true', default=True, help='是否使用多阈值选择最佳结果')
+
 # train
 parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0])
 parser.add_argument('--multi_gpu', action='store_true', default=False)
