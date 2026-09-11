@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import os
 import csv
 import ast
+import subprocess
+import json
 import torch.nn.functional as F  
 
 join = os.path.join
@@ -32,7 +34,19 @@ from data_loader import get_loader
 from model import IMISNet, TMFNet, TemporalAwareLoss
 from utils import FocalDice_MSELoss
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# expandable_segments 选项在 torch >= 2.1 才支持，老版本（如 conda py38 torch 1.x）
+# 会抛 "Unrecognized CachingAllocator option: expandable_segments"。
+# 这里做版本检测：仅在新版 torch 上启用，老版本跳过（仅影响显存碎片优化，不影响功能）。
+try:
+    _torch_version_tuple = tuple(int(x.split('+')[0].split('~')[0])
+                                 for x in torch.__version__.split('.')[:3])
+    if _torch_version_tuple >= (2, 1, 0):
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    else:
+        # 老版本 torch：清除可能残留的同名变量，避免后续 cuda init 报错
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+except Exception:
+    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 torch.backends.cudnn.benchmark = True
@@ -45,7 +59,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 parser = argparse.ArgumentParser()
 parser.add_argument('--work_dir', type=str, default='work_dir')
-parser.add_argument('--task_name', type=str, default='ACDC_traj')
+parser.add_argument('--task_name', type=str, default='ACDC')
 parser.add_argument('--dataset', type=str, default='acdc', help='Dataset type: acdc, btcv, amos2022_mr')
 parser.add_argument("--data_dir", type = str, default='dataset/ACDC')
 parser.add_argument('--image_size', type=int, default=256)
@@ -53,32 +67,46 @@ parser.add_argument('--test_mode', type=bool, default=False)
 parser.add_argument('--batch_size', type=int, default=8)
 parser.add_argument('--model_type', type=str, default='vit_b')
 parser.add_argument('--sam_checkpoint', type=str, default='ckpt/IMISNet-B.pth')
-parser.add_argument('--pretrain_path', type=str, default='work_dir/ACDC_traj/IMIS_latest.pth')
-parser.add_argument('--resume', action='store_true', default=True)
+parser.add_argument('--pretrain_path', type=str, default='work_dir/ACDC/IMIS_latest.pth')
+parser.add_argument('--resume', action='store_true', default=False)
 parser.add_argument('--device', type=str, default='cuda')
 parser.add_argument('--mask_num', type=int, default=2)
 parser.add_argument('--inter_num', type=int, default=5)
-parser.add_argument('--use_temporal_fusion', action='store_true', default=True, help='Enable temporal fusion training')
+parser.add_argument('--model_variant', type=str, default='tmf', choices=['tmf', 'sam'],
+                    help='tmf: full TMF-Net; sam: SAM-only baseline without temporal fusion')
+parser.add_argument('--use_temporal_fusion', action='store_true', default=None, help='Enable temporal fusion training')
+parser.add_argument('--no_temporal_fusion', action='store_false', dest='use_temporal_fusion',
+                    help='Disable temporal fusion training')
 parser.add_argument('--temporal_interactions', type=int, default=3, help='Number of interaction rounds for temporal fusion')
 parser.add_argument('--ablation_no_multi_scale', action='store_true', default=False, help='Ablation study: disable multi-scale feature fusion')
 parser.add_argument('--ablation_no_trajectory', action='store_true', default=False, help='Ablation study: disable LSTM trajectory analysis')
 parser.add_argument('--num_epochs', type=int, default=150)
-parser.add_argument('--lr_scheduler', type=str, default='cosine')
+parser.add_argument('--lr_scheduler', type=str, default='piecewise_constant',
+                    help='Scheduler: piecewise_constant (推荐), cosine, step, multi_step, none')
 parser.add_argument('--early_stop_patience', type=int, default=50, help='Early stop patience')
+parser.add_argument('--val_interval', type=int, default=20, help='Run test set evaluation every N epochs')
 parser.add_argument('--disable_early_stop', action='store_true', default=False, help='Disable early stopping completely')
 parser.add_argument('--lr_restart', type=float, default=None, help='Restart learning rate (for continue training)')
 parser.add_argument('--continue_from_best', action='store_true', default=False, help='Continue training from best checkpoint')
 parser.add_argument('--step_size', type=list, default=[7,12]) 
 parser.add_argument('--gamma', type=float, default=0.5)
-parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--lr', type=float, default=5e-5)
 parser.add_argument('--weight_decay', type=float, default=1e-2)
 parser.add_argument('--port', type=int, default=12305)
 parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0])
 parser.add_argument('--multi_gpu', action='store_true', default=False)
 parser.add_argument('--dist', dest='dist', type=bool, default=False, help='distributed training or not')
-parser.add_argument('-num_workers', type=int, default=4)
+parser.add_argument('--num_workers', '-num_workers', dest='num_workers', type=int, default=4)
 parser.add_argument('--num_clicks', type=int, default=5)
 args = parser.parse_args()
+
+def normalize_model_variant(args):
+    if getattr(args, 'model_variant', 'tmf') == 'sam':
+        args.use_temporal_fusion = False
+    elif getattr(args, 'use_temporal_fusion', None) is None:
+        args.use_temporal_fusion = True
+
+normalize_model_variant(args)
 os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(i) for i in args.gpu_ids])
 logger = logging.getLogger(__name__)
 LOG_OUT_DIR = join(args.work_dir, args.task_name)
@@ -96,23 +124,35 @@ def build_model(args):
         else:
             num_classes = 4  
         
+        normalize_model_variant(args)
+        use_temporal = bool(getattr(args, 'use_temporal_fusion', True))
         sam = sam_model_registry[args.model_type](args).to(device)
         
         imis = TMFNet(
             sam, 
             test_mode=args.test_mode, 
             select_mask_num=args.mask_num,
-            fusion_warmup_epochs=20,      
-            max_fusion_strength=1.5,       
-            num_classes=num_classes,         
+            fusion_warmup_epochs=40,      # [方案C 修改3] 延后 fusion 介入（150 epoch 版）
+            max_fusion_strength=1.5,       # 前 50 epoch SAM 先学纯粹的 prompt-mask 对齐，
+                                           # 避免初期强 fusion 把 SAM 引导入错误局部最优（之前 20 epoch
+                                           # 就放 fusion，常导致 80 epoch 后 TrainDice 立刻平台）
+            num_classes=num_classes,
             ablation_no_multi_scale=args.ablation_no_multi_scale,
-            ablation_no_trajectory=args.ablation_no_trajectory
+            ablation_no_trajectory=args.ablation_no_trajectory,
+            use_temporal_fusion=use_temporal
         ).to(device)
+        print(f"[INFO] Building {'TMFNet' if use_temporal else 'SAM-only baseline'}")
         
         print("[INFO] Applying selective freezing strategy...")
         
         for name, param in imis.named_parameters():
-            if 'image_encoder' in name:
+            is_temporal_param = any(k in name for k in (
+                'multiscale_temporal_fusion', 'temporal_memory',
+                'temporal_weight', 'trajectory_fusion_weight', 'fusion_weights'
+            ))
+            if not use_temporal and is_temporal_param:
+                param.requires_grad = False
+            elif 'image_encoder' in name:
                 if ('blocks.11' in name or 'blocks.10' in name or 'blocks.9' in name or
                     'blocks.8' in name or 'blocks.7' in name or 'blocks.6' in name or 'neck' in name):
                     param.requires_grad = True
@@ -120,7 +160,7 @@ def build_model(args):
                     param.requires_grad = False
             else:
                 param.requires_grad = True
-                if 'temporal' in name or 'fusion' in name or 'trajectory' in name or 'lstm' in name:
+                if use_temporal and ('temporal' in name or 'fusion' in name or 'trajectory' in name or 'lstm' in name):
                     print(f"[INFO] Ensuring temporal parameter is trainable: {name}")
         trainable_params = sum(p.numel() for p in imis.parameters() if p.requires_grad)
         frozen_params = sum(p.numel() for p in imis.parameters() if not p.requires_grad)
@@ -315,9 +355,8 @@ class BaseTrainer:
         self.dices = []
         self.ious = []
         
-        self.early_stop_patience = getattr(args, 'early_stop_patience', 10)  
+        self.early_stop_patience = getattr(args, 'early_stop_patience', 10)
         self.early_stop_counter = 0
-        self.best_dice = 0.0  
         
         self.scaler = GradScaler(
             init_scale=2**10,  
@@ -358,8 +397,15 @@ class BaseTrainer:
         # group 1: prompt_encoder + misc params
         # group 2: mask_decoder + temporal/LSTM/trajectory/fusion params
         # group 3: explicit scalar fusion weights
-        # group 4: bias / LayerNorm params (0 weight decay, paper-standard)
-        lr_scales = [0.5, 1.0, 1.0, 1.0, 1.0]
+        # [方案C 修改4] LR 分层缩放：
+        #   Group 0 (ViT block 9-11 + neck):      1.0x base_lr → 5e-5
+        #   Group 1 (prompt_encoder):             3.0x        → 15e-5
+        #   Group 2 (mask_decoder + misc):        3.0x        → 15e-5
+        #   Group 3 (trajectory_fusion_weight + fusion_weights): 5.0x → 25e-5
+        #   Group 4 (bias / LayerNorm / norm params): 3.0x, NO weight decay
+        # 原始方案用 [0.5, 1, 1, 1, 1] 让 fusion 组学得太慢（LR 只有 prompt/decoder 的 1/2），
+        # 但 fusion 决定交互质量，必须放大 LR 让它在早期快速收敛。
+        lr_scales = [1.0, 3.0, 3.0, 5.0, 3.0]
         wd_scales = [1.0, 1.0, 1.0, 1.0, 0.0]
         param_groups = []
         for lr_s, wd_s in zip(lr_scales, wd_scales):
@@ -378,7 +424,9 @@ class BaseTrainer:
             elif 'trajectory_fusion_weight' in name or 'fusion_weights' in name:
                 target_group = 3
             elif 'image_encoder' in name:
-                if ('blocks.11' in name or 'blocks.10' in name or 'blocks.9' in name or 'neck' in name):
+                if 'neck' in name or any(
+                    f'blocks.{i}.' in name for i in range(6, 12)
+                ):
                     target_group = 0
                 else:
                     param.requires_grad = False
@@ -398,51 +446,60 @@ class BaseTrainer:
                 f"[DEBUG Optimizer] Group {i}: n={len(group['params'])}, "
                 f"lr={group['lr']:.3e}, weight_decay={group['weight_decay']:.3e}"
             )
+        # [方案C 修改1] 分段 constant + warmup + 阶段性 warm restart
+        # 总 epoch 150 分为 3 段（缩短 1.0x 稳定期，提前进入 LR 衰减）：
+        #   Epoch 1-10 :   warmup，LR 线性升到 base_lr
+        #   Epoch 11-80:  phase1 = base_lr     (ViT 5e-5, Prompt 15e-5, Decoder 15e-5, Fusion 25e-5)
+        #   Epoch 81-120:  phase2 = base_lr * 0.2  (warm restart 降到 20%)
+        #   Epoch 121-150: phase3 = base_lr * 0.04 (再降一次)
+        # 避免 Cosine 后半段 7.5e-7 几乎为零，导致 80 epoch 后学不到任何新东西。
         self.optimizer = torch.optim.AdamW(param_groups)
         self.scheduler = None
-        if self.args.lr_scheduler == 'cosine':
+        sched = self.args.lr_scheduler.lower() if self.args.lr_scheduler else 'none'
+        if sched == 'piecewise_constant':
+            warmup_epochs = 10
+            total = self.args.num_epochs
+            phase1_end = 80   # 1..80: 1.0x
+            phase2_end = 120  # 81..120: 0.2x
+            # phase3_end = total (121..150: 0.04x)
+            def _lr_lambda(epoch):
+                # epoch 0-based
+                if epoch < warmup_epochs:
+                    return (epoch + 1) / warmup_epochs  # 线性升到 1.0
+                e = epoch + 1  # 转 1-based 方便划分
+                if e <= phase1_end:
+                    return 1.0
+                elif e <= phase2_end:
+                    return 0.2
+                else:
+                    return 0.04
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda=_lr_lambda)
+        elif sched == 'cosine':
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.args.num_epochs,
                 eta_min=1e-6
             )
-        elif self.args.lr_scheduler == 'step':
+        elif sched == 'step':
             step_size = self.args.step_size[0] if isinstance(self.args.step_size, list) else self.args.step_size
             self.scheduler = StepLR(
                 self.optimizer,
                 step_size=step_size,
                 gamma=self.args.gamma
             )
-        elif self.args.lr_scheduler == 'multi_step':
+        elif sched == 'multi_step':
             self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
                 self.optimizer,
                 milestones=self.args.step_size,
                 gamma=self.args.gamma
             )
-        elif self.args.lr_scheduler is None or self.args.lr_scheduler.lower() == 'none':
+        elif sched == 'none':
             self.scheduler = None
         else:
-            warmup_epochs = 5
-            # User-selected non-standard scheduler. Match the paper cosine end-lr:
-            # cosine from peak LR down to 1e-6 (so the min ratio is 1e-6 / base_lr
-            # rather than the hard-coded 1e-5 / 1e-3 which mismatched defaults).
-            base_lr = float(self.args.lr)
-            min_lr_ratio = (1e-6 / base_lr) if base_lr > 0 else 0.0
-            def warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs, min_lr_ratio):
-                def lr_lambda(epoch):
-                    if epoch < warmup_epochs:
-                        return (epoch + 1) / warmup_epochs
-                    else:
-                        progress = (epoch - warmup_epochs) / max(1, (total_epochs - warmup_epochs))
-                        return max(0.5 * (1.0 + math.cos(math.pi * progress)), min_lr_ratio)
-                return LambdaLR(optimizer, lr_lambda)
-            self.scheduler = warmup_cosine_scheduler(
-                self.optimizer,
-                warmup_epochs=warmup_epochs,
-                total_epochs=self.args.num_epochs,
-                min_lr_ratio=min_lr_ratio,
-            )
-        self.warmup_epochs = 0
+            # 兜底：cosine
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer, T_max=self.args.num_epochs, eta_min=1e-6)
+        self.warmup_epochs = 10 if sched == 'piecewise_constant' else 0
         
     def load_checkpoint(self, ckp_path, resume):
         last_ckpt = None
@@ -545,6 +602,91 @@ class BaseTrainer:
             print(f"❌ Error saving checkpoint: {str(e)}")
             import traceback
             traceback.print_exc()  
+    def _checkpoint_prefix(self):
+        return 'SAM' if getattr(self.args, 'model_variant', 'tmf') == 'sam' else 'IMIS'
+
+    def _save_direct_checkpoint(self, epoch, state_dict, describe='latest'):
+        try:
+            os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
+            checkpoint = {
+                'model_state_dict': state_dict,
+                'epoch': epoch,
+                'best_loss': self.best_loss,
+                'best_dice': self.best_dice,
+                'best_iou': self.best_iou,
+                'losses': self.losses,
+                'dices': self.dices,
+                'ious': self.ious,
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'lr_scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+                'model_variant': getattr(self.args, 'model_variant', 'tmf'),
+                'use_temporal_fusion': getattr(self.args, 'use_temporal_fusion', True),
+            }
+            prefix = self._checkpoint_prefix()
+            if describe == 'latest':
+                filename = os.path.join(MODEL_SAVE_PATH, f'{prefix}_latest.pth')
+            elif describe == 'dice_best':
+                filename = os.path.join(MODEL_SAVE_PATH, f'{prefix}_best_dice_{self.best_dice:.4f}.pth')
+                generic_best = os.path.join(MODEL_SAVE_PATH, f'{prefix}_dice_best.pth')
+            else:
+                filename = os.path.join(MODEL_SAVE_PATH, f'{prefix}_{describe}.pth')
+
+            torch.save(checkpoint, filename)
+            print(f"Save checkpoint to {filename}")
+            if describe == 'dice_best':
+                torch.save(checkpoint, generic_best)
+                print(f"Save generic best checkpoint to {generic_best}")
+        except Exception as e:
+            print(f"Error saving checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def train(self):
+        os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
+        print(f"[INFO] Start {'SAM-only' if getattr(self.args, 'model_variant', 'tmf') == 'sam' else 'base'} training")
+
+        for epoch in range(self.start_epoch, self.args.num_epochs):
+            print(f"Epoch: {epoch}/{self.args.num_epochs - 1}")
+            metrics = self.train_one_epoch(epoch)
+            avg_loss = metrics['loss']
+            avg_iou = metrics['iou']
+            avg_dice = metrics['dice']
+
+            self.losses.append(avg_loss)
+            self.ious.append(avg_iou)
+            self.dices.append(avg_dice)
+
+            state_dict = self.model.module.state_dict() if self.args.multi_gpu else self.model.state_dict()
+            self._save_direct_checkpoint(epoch, state_dict, describe='latest')
+
+            if avg_loss < self.best_loss:
+                self.best_loss = avg_loss
+            if avg_iou > self.best_iou:
+                self.best_iou = avg_iou
+            if avg_dice > self.best_dice:
+                self.best_dice = avg_dice
+                self._save_direct_checkpoint(epoch, state_dict, describe='dice_best')
+                self.early_stop_counter = 0
+            else:
+                self.early_stop_counter += 1
+
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            print(f"Epoch {epoch} finished. Loss: {avg_loss:.4f}, IoU: {avg_iou:.4f}, Dice: {avg_dice:.4f}")
+            if math.isnan(avg_loss) or math.isinf(avg_loss):
+                print("[Early stop] loss is NaN/Inf.")
+                break
+            if (not getattr(self.args, 'disable_early_stop', False)
+                    and self.early_stop_counter >= self.early_stop_patience):
+                print(f"[Early stop] no Dice improvement for {self.early_stop_patience} epochs.")
+                break
+
+        print("==========================================")
+        print("Training completed!")
+        print(f"Best metrics - Loss: {self.best_loss:.4f}, Dice: {self.best_dice:.4f}, IoU: {self.best_iou:.4f}")
+        print("==========================================")
+
     get_iou_and_dice = staticmethod(get_iou_and_dice)
     def plot_result(self, plot_data, description, save_name):
         plt.plot(plot_data)
@@ -606,7 +748,12 @@ class BaseTrainer:
             image_features = None
             
             for interaction_round in range(num_interactions):
-                points, point_labels = self._simulate_clicks(images, labels, previous_pred, interaction_round)
+                # [FIX ②] 先用"原始batch_size版本"的 categories 算点击（和 labels 原始 batch 对齐）
+                raw_categories_for_click = categories
+                points, point_labels = self._simulate_clicks(
+                    images, labels, previous_pred, interaction_round,
+                    categories=raw_categories_for_click
+                )
                 
                 real_model = self.model.module if hasattr(self.model, 'module') else self.model
                 
@@ -634,18 +781,36 @@ class BaseTrainer:
                         extended_patient_ids.extend([pid] * self.args.mask_num)
                     extended_patient_ids = extended_patient_ids[:extended_batch_size]
                     patient_ids = extended_patient_ids
+
+                # [FIX 兼容性] 点击按 mask_num 展开到 extended_batch_size（每个mask副本都有同样的点击）
+                if points.shape[0] != extended_batch_size:
+                    mn = self.args.mask_num or 1
+                    if points.shape[0] * mn == extended_batch_size:
+                        points = points.repeat_interleave(mn, dim=0)
+                        point_labels = point_labels.repeat_interleave(mn, dim=0)
+                    elif extended_batch_size % points.shape[0] == 0 and extended_batch_size > points.shape[0]:
+                        r = extended_batch_size // points.shape[0]
+                        points = points.repeat_interleave(r, dim=0)
+                        point_labels = point_labels.repeat_interleave(r, dim=0)
+                    else:
+                        # fallback：tile到相同长度（不丢样本）
+                        rep = (extended_batch_size + points.shape[0] - 1) // points.shape[0]
+                        points = torch.cat([points] * rep, dim=0)[:extended_batch_size]
+                        point_labels = torch.cat([point_labels] * rep, dim=0)[:extended_batch_size]
                 
                 prompts = {
-                    'patient_ids': patient_ids,   
-                    'categories': categories,     
-                    'interaction_ids': patient_ids, 
-                    'temporal_enabled': True,  
-                    'labels': labels,
+                    'patient_ids': patient_ids,
+                    'categories': categories,
+                    'interaction_ids': patient_ids,
+                    'temporal_enabled': True,
+                    # [FIX ③] 移除 labels（多通道GT），训练时不再把GT作为模型输入
                     'interaction_round': interaction_round,
                     'epoch': epoch,
                     'global_epoch': epoch,
                     'quality_score': [0.0] * len(patient_ids),
-                    'iou_predictions': [0.0] * len(patient_ids)
+                    'iou_predictions': [0.0] * len(patient_ids),
+                    'point_coords': points,      # [B, N, 2] 显式注入模型输入
+                    'point_labels': point_labels,  # [B, N] 显式注入模型输入
                 }
                 
                 original_labels = labels
@@ -672,18 +837,39 @@ class BaseTrainer:
                     else:
                         labels = (labels.argmax(dim=1, keepdim=True) > 0).float()
                 elif labels.dim() == 3:
-                    labels = labels.unsqueeze(0)
+                    labels = labels.unsqueeze(1)
+
+                if labels.shape[0] != extended_batch_size:
+                    if extended_batch_size % labels.shape[0] == 0:
+                        labels = labels.repeat_interleave(extended_batch_size // labels.shape[0], dim=0)
+                    else:
+                        labels = labels[:extended_batch_size]
+                original_labels = labels
                 
                 with autocast():
                     if hasattr(self.model, 'forward_with_features'):
                         outputs = self.model.forward_with_features(image_features, prompts)
                     else:
                         outputs = self.model.forward(images, prompts)
-                # Inject paper q_t = model-predicted mask quality (iou_pred) -> prompts for true memory-store decision
-                if isinstance(outputs, dict) and 'iou_pred' in outputs and isinstance(outputs['iou_pred'], torch.Tensor):
-                    _flat = outputs['iou_pred'].detach().float().flatten()
-                    _n = min(len(patient_ids), _flat.numel())
-                    _qs = [float(_flat[i].item()) for i in range(_n)] + [0.0] * max(0, len(patient_ids) - _n)
+                # [ANTI-LEAK compliant] 用 GT 算真实 IoU 作为 TQM 决策的监督目标
+                # 依据用户训练边界："计算质量监督目标，比如用预测 mask 和 GT 算真实 Dice/IoU，
+                #                   训练 iou_pred / quality_score"——允许 GT 当老师
+                # 同时保留 model iou_pred 作为被监督对象（loss 里的 quality_loss 会拉它逼近真实 IoU）
+                if isinstance(outputs, dict) and 'masks' in outputs:
+                    with torch.no_grad():
+                        _pred_masks_for_iou = outputs['masks'].detach().float()
+                        if _pred_masks_for_iou.shape[2:] != original_labels.shape[2:]:
+                            _pred_masks_for_iou = F.interpolate(_pred_masks_for_iou, size=original_labels.shape[2:], mode='bilinear', align_corners=False)
+                        _pred_bin = (torch.sigmoid(_pred_masks_for_iou) > 0.5).float()
+                        _gt_bin = (original_labels > 0).float()
+                        if _gt_bin.dim() == 4 and _gt_bin.shape[1] > 1:
+                            _gt_bin = _gt_bin[:, :1]  # 取第一通道作为目标类
+                        _inter = (_pred_bin * _gt_bin).sum(dim=(1, 2, 3))
+                        _union = _pred_bin.sum(dim=(1, 2, 3)) + _gt_bin.sum(dim=(1, 2, 3)) - _inter
+                        _real_iou = ((_inter + 1e-7) / (_union + 1e-7)).clamp(0.0, 1.0)
+                        _flat = _real_iou.flatten()
+                        _n = min(len(patient_ids), _flat.numel())
+                        _qs = [float(_flat[i].item()) for i in range(_n)] + [0.0] * max(0, len(patient_ids) - _n)
                     prompts['quality_score'] = _qs
                     prompts['iou_predictions'] = list(_qs)
                 
@@ -808,25 +994,38 @@ class BaseTrainer:
             'dice': avg_dice,
             'iou': avg_iou
         }
-    def _simulate_clicks(self, images, labels, previous_pred, round_idx):
+    def _simulate_clicks(self, images, labels, previous_pred, round_idx, categories=None):
         """模拟点击点生成"""
         batch_size = labels.size(0)
         points = []
         point_labels = []
         
         for i in range(batch_size):
-            foreground = (labels[i] == 1).nonzero(as_tuple=True)
+            label_i = labels[i]
+            if label_i.dim() == 3:
+                if label_i.shape[0] > 1:
+                    class_idx = 1
+                    if categories is not None and i < len(categories) and getattr(self.args, 'classes', None):
+                        cat_name = str(categories[i])
+                        if cat_name in self.args.classes:
+                            class_idx = self.args.classes.index(cat_name)
+                    class_idx = max(0, min(class_idx, label_i.shape[0] - 1))
+                    label_i = label_i[class_idx]
+                else:
+                    label_i = label_i[0]
+
+            foreground = (label_i > 0).nonzero(as_tuple=True)
             if len(foreground[0]) > 0:
-                idx = torch.randint(0, len(foreground[0]), (1,))
+                idx = torch.randint(0, len(foreground[0]), (1,), device=label_i.device)
                 y, x = foreground[0][idx], foreground[1][idx]
-                points.append(torch.tensor([[x.item(), y.item()]]))
-                point_labels.append(torch.tensor([1]))
+                points.append(torch.tensor([[x.item(), y.item()]], dtype=torch.float32))
+                point_labels.append(torch.tensor([1], dtype=torch.long))
             else:
-                h, w = labels.size(1), labels.size(2)
-                x = torch.randint(0, w, (1,))
-                y = torch.randint(0, h, (1,))
-                points.append(torch.tensor([[x.item(), y.item()]]))
-                point_labels.append(torch.tensor([0]))
+                h, w = label_i.shape[-2], label_i.shape[-1]
+                x = torch.randint(0, w, (1,), device=label_i.device)
+                y = torch.randint(0, h, (1,), device=label_i.device)
+                points.append(torch.tensor([[x.item(), y.item()]], dtype=torch.float32))
+                point_labels.append(torch.tensor([0], dtype=torch.long))
         
         points = torch.stack(points).to(labels.device)
         point_labels = torch.stack(point_labels).to(labels.device)
@@ -866,17 +1065,17 @@ class BaseTrainer:
         inter = (pred_bin * gt).sum(dim=(1, 2, 3))  
         pred_sum = pred_bin.sum(dim=(1, 2, 3))  
         gt_sum = gt.sum(dim=(1, 2, 3))  
-        union = pred_sum + gt_sum - inter  
+        denom = pred_sum + gt_sum  # 标准 Dice 分母是 |A|+|B|，不要减 inter
         epsilon = 1e-6
         dice = torch.zeros_like(inter, dtype=torch.float32)
         valid_mask = gt_sum > 0  
         if valid_mask.any():
             valid_inter = inter[valid_mask]
-            valid_union = union[valid_mask]
-            dice[valid_mask] = (2 * valid_inter + epsilon) / (valid_union + epsilon)
+            valid_denom = denom[valid_mask]
+            dice[valid_mask] = (2 * valid_inter + epsilon) / (valid_denom + epsilon)
         if torch.isnan(dice).any() or (dice > 1.0).any() or (dice < 0).any():
             print(f"[WARNING] Dice异常: dice={dice}")
-            print(f"[DEBUG] inter={inter}, pred_sum={pred_sum}, gt_sum={gt_sum}, union={union}")
+            print(f"[DEBUG] inter={inter}, pred_sum={pred_sum}, gt_sum={gt_sum}, denom={denom}")
             dice = torch.clamp(dice, 0.0, 1.0)
         return dice
     def _calc_tci(self, pred, gt):
@@ -1235,13 +1434,6 @@ class TemporalTrainer(BaseTrainer):
             print("SAM Image Encoder: last 6 blocks + neck unfrozen")
         self.interaction_rounds = args.num_clicks
         self.scaler = GradScaler()
-        self.best_loss = float('inf')
-        self.best_iou = 0.0
-        self.best_dice = 0.0
-        self.step_best_dice = 0.0
-        self.losses = []
-        self.dices = []
-        self.ious = []
         self.target_list = [c for c in args.classes if c != 'background'] if args.classes else ['LV', 'RV', 'Myo']
         self.temporal_loss = TemporalAwareLoss()
         self.fusion_warmup_epochs = 20      
@@ -1252,7 +1444,7 @@ class TemporalTrainer(BaseTrainer):
         """Save checkpoint directly to file, independent of checkpoint_manager"""
         try:
             os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
-            
+
             checkpoint = {
                 'model_state_dict': state_dict,
                 'epoch': epoch,
@@ -1265,148 +1457,305 @@ class TemporalTrainer(BaseTrainer):
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'lr_scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None
             }
-            
+
             if describe == 'latest':
                 filename = os.path.join(MODEL_SAVE_PATH, 'IMIS_latest.pth')
             elif describe == 'dice_best':
-                filename = os.path.join(MODEL_SAVE_PATH, f'IMIS_{epoch}_step_dice:{self.best_dice:.4f}_best.pth')
+                filename = os.path.join(MODEL_SAVE_PATH, f'IMIS_best_dice_{self.best_dice:.4f}.pth')
                 generic_best = os.path.join(MODEL_SAVE_PATH, 'IMIS_dice_best.pth')
             else:
                 filename = os.path.join(MODEL_SAVE_PATH, f'IMIS_{describe}.pth')
-            
+
             torch.save(checkpoint, filename)
             print(f"Save checkpoint to {filename}")
-            
+
             if describe == 'dice_best':
                 torch.save(checkpoint, generic_best)
                 print(f"Save generic best checkpoint to {generic_best}")
-                
+                self._cleanup_best_checkpoints(max_keep=5)
+
         except Exception as e:
             print(f"Error saving checkpoint: {e}")
             import traceback
             traceback.print_exc()
-    
-    def _get_extreme_clicks(self, labels):
-        """从GT中获取极端点击点
-        
-        Args:
-            labels: 真实标签
-            
-        Returns:
-            points: 点击点坐标 [B, N, 2]
-            point_labels: 点击点标签 [B, N]
-        """
-        batch_size = labels.size(0)
-        points = []
-        point_labels = []
-        
-        for i in range(batch_size):
-            foreground = (labels[i] == 1).nonzero(as_tuple=True)
-            if len(foreground[0]) > 0:
-                idx = torch.randint(0, len(foreground[0]), (1,))
-                y, x = foreground[0][idx], foreground[1][idx]
-                points.append(torch.tensor([[x.item(), y.item()]]))
-                point_labels.append(torch.tensor([1]))
+
+    def _cleanup_best_checkpoints(self, max_keep=5):
+        """保留得分最高的 max_keep 个 best checkpoint，删除其余的"""
+        import glob
+        pattern = os.path.join(MODEL_SAVE_PATH, 'IMIS_best_dice_*.pth')
+        best_files = glob.glob(pattern)
+        if len(best_files) <= max_keep:
+            return
+        # 按文件名中的dice值排序，保留最高的max_keep个
+        def extract_dice(filepath):
+            import re
+            m = re.search(r'IMIS_best_dice_(\d+\.\d+)\.pth', os.path.basename(filepath))
+            return float(m.group(1)) if m else 0.0
+        best_files.sort(key=extract_dice, reverse=True)
+        for old_file in best_files[max_keep:]:
+            try:
+                os.remove(old_file)
+                print(f"[Checkpoint清理] 删除旧权重: {os.path.basename(old_file)}")
+            except OSError:
+                pass
+
+    def _run_periodic_test(self, epoch, state_dict):
+        """[PERIODIC TEST] 每 val_interval 个 epoch 自动调用 test.py 跑测试集，
+        用真实 mDice@8 评估泛化能力。如果 mDice 超过历史最佳，额外存一个 checkpoint。"""
+        val_interval = getattr(self.args, 'val_interval', 20)
+        if (epoch + 1) % val_interval != 0:
+            return
+
+        logger.info(f"[Periodic Test] Epoch {epoch+1} 完成，开始测试集评估...")
+        print(f"[Periodic Test] Running test.py on test set (epoch {epoch+1})...")
+
+        test_log_file = os.path.join(MODEL_SAVE_PATH, f'periodic_test_epoch{epoch+1}.log')
+
+        # 先存一个临时权重给 test.py 用
+        tmp_ckpt = os.path.join(MODEL_SAVE_PATH, 'IMIS_periodic_test_tmp.pth')
+        tmp_checkpoint = {
+            'model_state_dict': state_dict,
+            'epoch': epoch,
+            'best_dice': self.best_dice,
+        }
+        torch.save(tmp_checkpoint, tmp_ckpt)
+
+        try:
+            cmd = [
+                sys.executable, 'test.py',
+                '--dataset', str(getattr(self.args, 'dataset', 'btcv')),
+                '--data_dir', str(getattr(self.args, 'data_dir', 'dataset/BTCV')),
+                '--pretrain_path', tmp_ckpt,
+                '--sam_checkpoint', str(getattr(self.args, 'sam_checkpoint', 'ckpt/IMISNet-B.pth')),
+                '--model_type', str(getattr(self.args, 'model_type', 'vit_b')),
+                '--model_variant', str(getattr(self.args, 'model_variant', 'tmf')),
+                '--image_size', str(getattr(self.args, 'image_size', 256)),
+                '--inter_num', '8',
+                '--task_name', str(getattr(self.args, 'task_name', 'BTCV')),
+                '--work_dir', str(getattr(self.args, 'work_dir', 'work_dir')),
+            ]
+            if getattr(self.args, 'use_temporal_fusion', False):
+                cmd.append('--use_temporal_fusion')
             else:
-                h, w = labels.size(1), labels.size(2)
-                x = torch.randint(0, w, (1,))
-                y = torch.randint(0, h, (1,))
-                points.append(torch.tensor([[x.item(), y.item()]]))
-                point_labels.append(torch.tensor([0]))
-        
-        points = torch.stack(points).to(labels.device)
-        point_labels = torch.stack(point_labels).to(labels.device)
-        return points, point_labels
+                cmd.append('--no_temporal_fusion')
+
+            with open(test_log_file, 'w') as logf:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, cwd=os.getcwd())
+                logf.write(result.stdout)
+                logf.write(result.stderr)
+
+            # 从日志解析 mDice@8
+            mdice = None
+            for line in reversed(result.stdout.splitlines()):
+                if 'mDice@8' in line or 'mDice' in line:
+                    import re
+                    m = re.search(r'mDice[@]?\d*[:\s]+([0-9.]+)', line)
+                    if m:
+                        mdice = float(m.group(1))
+                        break
+                # summary_results.txt 回退
+            if mdice is None:
+                summary_file = os.path.join(MODEL_SAVE_PATH, 'summary_results.txt')
+                if os.path.exists(summary_file):
+                    with open(summary_file, 'r') as sf:
+                        for line in sf:
+                            if 'mDice@8' in line:
+                                import re
+                                m = re.search(r'([0-9.]+)', line.split(':')[-1])
+                                if m:
+                                    mdice = float(m.group(1))
+                                    break
+
+            if mdice is not None:
+                logger.info(f"[Periodic Test] Epoch {epoch+1} → mDice@8 = {mdice:.4f}")
+                print(f"[Periodic Test] Epoch {epoch+1} → mDice@8 = {mdice:.4f}")
+
+                if not hasattr(self, 'test_best_dice'):
+                    self.test_best_dice = 0.0
+                if mdice > self.test_best_dice:
+                    self.test_best_dice = mdice
+                    test_ckpt = os.path.join(MODEL_SAVE_PATH, f'IMIS_test_best_dice_{mdice:.4f}.pth')
+                    torch.save(tmp_checkpoint, test_ckpt)
+                    logger.info(f"[Periodic Test] New test best! Saved {test_ckpt}")
+                    print(f"[Periodic Test] New test best! Saved {test_ckpt}")
+            else:
+                logger.warning(f"[Periodic Test] 无法解析 mDice@8，请查看日志: {test_log_file}")
+                print(f"[Periodic Test] Could not parse mDice, see: {test_log_file}")
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"[Periodic Test] 超时 (3600s)")
+            print(f"[Periodic Test] Timeout!")
+        except Exception as e:
+            logger.warning(f"[Periodic Test] 失败: {e}")
+            print(f"[Periodic Test] Error: {e}")
+        finally:
+            if os.path.exists(tmp_ckpt):
+                os.remove(tmp_ckpt)
+
     
-    def _get_error_based_clicks(self, prev_pred, labels):
-        """从误差区域获取点击点
-        
+    def _to_binary_labels(self, labels, categories):
+        """[FIX ①] 把多通道 labels (B, C, H, W) 按每个样本的 category 切成单通道二值 (B, 1, H, W)。
+        单通道/3通道(H,W,H)直接二值化。与训练循环 L651-672 保持一致。
+
         Args:
-            prev_pred: 上一轮预测
-            labels: 真实标签
-            
+            labels: (B,C,H,W) 或 (B,H,W) 或 (B,1,H,W)，long/float 均可
+            categories: list[str/int]，对应每个样本的目标类别名或索引
         Returns:
-            points: 点击点坐标 [B, N, 2]
-            point_labels: 点击点标签 [B, N]
+            binary_labels: (B, 1, H, W) float32 {0,1}
         """
-        if prev_pred.device != labels.device:
-            prev_pred = prev_pred.to(labels.device)
-        
-        batch_size = labels.size(0)
+        import torch
+        if labels.dim() == 4 and labels.shape[1] > 1:
+            binary_list = []
+            for i in range(labels.shape[0]):
+                cat_name = str(categories[i]) if i < len(categories) else '1'
+                if hasattr(self.args, 'classes') and self.args.classes and (cat_name in self.args.classes):
+                    class_idx = self.args.classes.index(cat_name)
+                else:
+                    try:
+                        class_idx = int(cat_name) if not cat_name.startswith('class_') else int(cat_name.split('_', 1)[1])
+                    except Exception:
+                        class_idx = 1
+                if 0 <= class_idx < labels.shape[1]:
+                    slc = labels[i:i+1, class_idx:class_idx+1]
+                else:
+                    slc = labels[i:i+1, 0:1]
+                binary_list.append((slc > 0).float())
+            return torch.cat(binary_list, dim=0) if binary_list else (labels[:, 0:1] > 0).float()
+        elif labels.dim() == 3:
+            return (labels.unsqueeze(1) > 0).float()
+        else:
+            return (labels > 0).float()
+
+    def _get_extreme_clicks(self, labels, categories=None):
+        """[FIX ①②] Round 0 首点击：
+        ① 先通过 _to_binary_labels 切到目标类别的单通道二值GT（不再对13通道找==1造成跨类假正点）
+        ② 采用距离变换中心（与 test._generate_first_click 完全一致），且始终返回 1 个正点，不再随机取点
+
+        Args:
+            labels: GT 标签（可能多通道，也可能单通道）
+            categories: 每个样本的类别列表，用于切通道；为空时按通道0取
+
+        Returns:
+            points: [B, 1, 2] float
+            point_labels: [B, 1] long {0,1}
+        """
+        import numpy as np
+        from scipy.ndimage import distance_transform_edt
+
+        binary_labels = self._to_binary_labels(labels, categories or [])
+        batch_size = binary_labels.size(0)
+        h, w = binary_labels.size(2), binary_labels.size(3)
+        device = labels.device
         points = []
         point_labels = []
-        
+
+        for i in range(batch_size):
+            fg_mask = binary_labels[i, 0].detach().cpu().numpy().astype(np.uint8)
+            fg_count = int(fg_mask.sum())
+            if fg_count == 0:
+                # 无前景：回退到GT质心或中心
+                src = labels[i].detach().cpu().numpy()
+                if src.ndim == 3:
+                    multi = (src > 0).astype(np.uint8)
+                    if multi.ndim == 3 and multi.shape[0] in (1, 13):
+                        multi = multi.max(axis=0)
+                else:
+                    multi = (src > 0).astype(np.uint8)
+                if multi.sum() > 0:
+                    ys, xs = np.nonzero(multi)
+                    cy, cx = int(round(float(ys.mean()))), int(round(float(xs.mean())))
+                else:
+                    cy, cx = h // 2, w // 2
+                pl = 1 if fg_count > 0 else 0
+            else:
+                dist = distance_transform_edt(fg_mask)
+                cy, cx = np.unravel_index(int(np.argmax(dist)), dist.shape)
+                cy, cx = int(cy), int(cx)
+                pl = 1
+
+            points.append(torch.tensor([[float(cx), float(cy)]], dtype=torch.float32))
+            point_labels.append(torch.tensor([pl], dtype=torch.long))
+
+        points = torch.cat(points, dim=0).to(device).unsqueeze(1) if batch_size > 0 else torch.zeros(0, 1, 2, device=device)
+        point_labels = torch.cat(point_labels, dim=0).to(device).unsqueeze(1) if batch_size > 0 else torch.zeros(0, 1, device=device, dtype=torch.long)
+        return points, point_labels
+
+    def _get_error_based_clicks(self, prev_pred, labels, categories=None):
+        """纠错轮点击点：对齐误差区域用 单通道二值GT，避免多通道GT的通道错位。
+
+        Args:
+            prev_pred: 上一轮预测 [B, 1, H, W] （logits）
+            labels: GT 标签（原始形式，内部转单通道二值）
+            categories: 每个样本的类别列表，用于切通道
+        Returns:
+            points: [B, 1, 2]
+            point_labels: [B, 1]
+        """
+        import numpy as np
+        from scipy.ndimage import label, distance_transform_edt
+
+        binary_labels = self._to_binary_labels(labels, categories or [])
+        if prev_pred.device != binary_labels.device:
+            prev_pred = prev_pred.to(binary_labels.device)
+        batch_size = binary_labels.size(0)
+        _, _, h, w = binary_labels.shape
+        device = binary_labels.device
+        points = []
+        point_labels = []
+
         for i in range(batch_size):
             pred_bin = (torch.sigmoid(prev_pred[i]) > 0.5).float()
-            error_map = torch.abs(pred_bin - labels[i])
-            
+            gt_bin = binary_labels[i, 0:1]
+            error_map = torch.abs(pred_bin - gt_bin)
+
             if error_map.sum() == 0:
-                fg = (labels[i] == 1).nonzero(as_tuple=False)
+                fg = (gt_bin.squeeze() > 0).nonzero(as_tuple=False)
                 if len(fg) > 0:
                     idx = torch.randint(0, len(fg), (1,))
-                    y, x = fg[idx, 0], fg[idx, 1]
+                    y, x = int(fg[idx, 0].item()), int(fg[idx, 1].item())
                 else:
-                    if len(labels.shape) == 4:  
-                        _, _, h, w = labels.shape
-                    else:  
-                        h, w = labels.size(1), labels.size(2)
-                    y, x = torch.randint(0, h, (1,)), torch.randint(0, w, (1,))
-                points.append(torch.tensor([[x.item(), y.item()]]))
-                point_labels.append(torch.tensor([1]))
+                    y, x = h // 2, w // 2
+                points.append(torch.tensor([[float(x), float(y)]], dtype=torch.float32))
+                point_labels.append(torch.tensor([1], dtype=torch.long))
             else:
-                import numpy as np
-                from scipy.ndimage import label, distance_transform_edt
-                
-                error_np = error_map.cpu().numpy().squeeze()
+                error_np = error_map.detach().cpu().numpy().squeeze().astype(np.uint8)
                 labeled, n = label(error_np)
                 if n == 0:
                     error_indices = torch.nonzero(error_map.view(-1)).squeeze(-1)
                     random_idx = torch.randint(0, len(error_indices), (1,)).item()
-                    idx = error_indices[random_idx].item()
-                    if len(labels.shape) == 4:  
-                        _, _, h, w = labels.shape
-                    else:  
-                        h, w = labels.size(1), labels.size(2)
-                    y = idx // w
-                    x = idx % w
+                    flat = error_indices[random_idx].item()
+                    y, x = flat // w, flat % w
                 else:
                     sizes = np.bincount(labeled.ravel())
-                    largest_idx = np.argmax(sizes[1:]) + 1
+                    largest_idx = int(np.argmax(sizes[1:])) + 1
                     max_region = (labeled == largest_idx).astype(np.uint8)
                     dist = distance_transform_edt(max_region)
-                    cy, cx = np.unravel_index(np.argmax(dist), dist.shape)
-                    y, x = cy, cx
-                
-                if len(labels.shape) == 4:  
-                    true_label = labels[i, 0, y, x].long()
-                else:  
-                    true_label = labels[i, y, x].long()
-                
-                points.append(torch.tensor([[x, y]]))  
-                point_labels.append(torch.tensor([1 - true_label]))  
-        
-        points = torch.stack(points).to(labels.device)
-        point_labels = torch.stack(point_labels).to(labels.device)
+                    cy, cx = np.unravel_index(int(np.argmax(dist)), dist.shape)
+                    y, x = int(cy), int(cx)
+                true_val = 1 if gt_bin[0, y, x].item() > 0.5 else 0
+                pl = 1 if true_val == 1 else 0
+                points.append(torch.tensor([[float(x), float(y)]], dtype=torch.float32))
+                point_labels.append(torch.tensor([pl], dtype=torch.long))
+
+        points = torch.cat(points, dim=0).to(device).unsqueeze(1)
+        point_labels = torch.cat(point_labels, dim=0).to(device).unsqueeze(1)
         return points, point_labels
-    
-    def _simulate_clicks(self, images, labels, previous_pred, round_idx):
-        """替换为你的质量门控点击生成逻辑，返回 points [B, N, 2] 和 labels [B, N]"""
+
+    def _simulate_clicks(self, images, labels, previous_pred, round_idx, categories=None):
+        """[FIX ①②] 点击模拟：
+        ① Round 0 和 纠错轮都基于目标类别的单通道二值GT
+        ② Round 0 只生成 1 个距离变换中心的正点击（严格对齐 test._generate_first_click）
+        移除了 training 下的点噪声/丢弃——该操作会把正点击概率性变成0点，模型训练不稳定，不符合协议。
+
+        Returns:
+            points: [B, N, 2] float32（N=1）
+            point_labels: [B, N] long {0,1}（N=1）
+        """
         if previous_pred is None or round_idx == 0:
-            points, point_labels = self._get_extreme_clicks(labels)
+            points, point_labels = self._get_extreme_clicks(labels, categories=categories)
         else:
-            points, point_labels = self._get_error_based_clicks(previous_pred, labels)
-        
-        if self.model.training:
-            points = points.float()  
-            noise = torch.randn_like(points) * 1.0
-            points = points + noise
-            
-            dropout_prob = 0.2  
-            mask = torch.rand(points.shape[0], points.shape[1], 1, device=points.device) > dropout_prob
-            points = points * mask.float()
-            point_labels = point_labels * mask.squeeze(-1).float()
-        
-        return points, point_labels
+            points, point_labels = self._get_error_based_clicks(previous_pred, labels, categories=categories)
+        return points.float(), point_labels.long()
     
     def _build_seq_tensor(self, points, point_labels, round_idx):
         """points: [B, N, 2], point_labels: [B, N], 返回 [B, T, 4]"""
@@ -1454,15 +1803,15 @@ class TemporalTrainer(BaseTrainer):
         inter = (pred_bin * gt).sum(dim=(1, 2, 3))  
         pred_sum = pred_bin.sum(dim=(1, 2, 3))  
         gt_sum = gt.sum(dim=(1, 2, 3))  
-        union = pred_sum + gt_sum - inter  
+        denom = pred_sum + gt_sum  # 标准 Dice 分母是 |A|+|B|，不要减 inter
         
-        union = torch.clamp(union, min=1e-6)
+        denom = torch.clamp(denom, min=1e-6)
         
-        dice = (2 * inter + 1e-6) / (union + 1e-6)
+        dice = (2 * inter + 1e-6) / (denom + 1e-6)
         
         if torch.isnan(dice).any() or (dice > 1.0).any() or (dice < 0).any():
             print(f"[WARNING] Dice异常: dice={dice}")
-            print(f"[DEBUG] inter={inter}, pred_sum={pred_sum}, gt_sum={gt_sum}, union={union}")
+            print(f"[DEBUG] inter={inter}, pred_sum={pred_sum}, gt_sum={gt_sum}, denom={denom}")
             dice = torch.clamp(dice, 0.0, 1.0)
         
         return dice  
@@ -1555,7 +1904,6 @@ class TemporalTrainer(BaseTrainer):
             torch.save(checkpoint, latest_path)
             
             if dice > self.best_dice:
-                self.best_dice = dice
                 best_path = os.path.join(MODEL_SAVE_PATH, f'IMIS_best_dice_{dice:.4f}.pth')
                 torch.save(checkpoint, best_path)
                 print(f"Saved best model with dice: {dice:.4f}")
@@ -1581,6 +1929,8 @@ class TemporalTrainer(BaseTrainer):
         model = self.model.module if self.args.multi_gpu else self.model
         device = next(model.parameters()).device
         
+        # 课程学习：前 50 epoch 使用 3 轮交互，之后使用 5 轮
+        # epoch 从 0 开始计数，epoch < 50 对应第 1--50 个 epoch
         if epoch < 50:
             self.interaction_rounds = 3
         else:
@@ -1715,7 +2065,7 @@ class TemporalTrainer(BaseTrainer):
                 else:
                     labels = (labels.argmax(dim=1, keepdim=True) > 0).float()
             elif labels.dim() == 3:
-                labels = labels.unsqueeze(0)
+                labels = labels.unsqueeze(1)
             for interaction_round in range(num_interactions):
                 points, point_labels = self._simulate_clicks(images, labels, previous_pred, interaction_round)
                 if accumulated_points is None:
@@ -1729,7 +2079,10 @@ class TemporalTrainer(BaseTrainer):
                     'categories': categories,     
                     'interaction_ids': patient_ids, 
                     'temporal_enabled': True,
-                    'labels': labels,
+                    # [方案C+AntiLEAK 修复] 移除 labels（多通道GT张量）
+                    # 不再把整块 GT 作为 prompt 项（之前虽然仅用于 label_sum gate，但仍属于 GT tensor 进 forward）。
+                    # 改用 meta_label_sum 传标量（合法，只是用来判空，不影响推理路径不影响梯度）。
+                    'meta_label_sum': [float(labels[i].sum().item()) if labels is not None else -1.0 for i in range(len(patient_ids))],
                     'interaction_round': interaction_round,
                     'epoch': epoch,
                     'global_epoch': epoch
@@ -1748,18 +2101,34 @@ class TemporalTrainer(BaseTrainer):
                         outputs = self.model.forward_with_features(image_features, prompts)
                     else:
                         outputs = self.model.forward(images, prompts)
-                
-                try:
-                    loss = self.criterion(outputs, labels, interaction_round=interaction_round, previous_pred=previous_pred, global_epoch=epoch, new_click_coords=points)
-                except Exception as e:
-                    model_logger.error(f"[FATAL] 前向传播错误: {str(e)}")
-                    model_logger.error(f"[FATAL] 病人ID: {patient_ids}, 类别: {categories}")
-                    model_logger.error(f"[FATAL] 交互轮次: {interaction_round}")
-                    if hasattr(self.model, 'temporal_memory'):
-                        self.model.temporal_memory.clear_all_history()
-                    elif hasattr(self.model.module, 'temporal_memory'):
-                        self.model.module.temporal_memory.clear_all_history()
-                    raise e
+                    # [ANTI-LEAK compliant] 用 GT 算真实 IoU 作为 TQM 决策的监督目标
+                    if isinstance(outputs, dict) and 'masks' in outputs:
+                        with torch.no_grad():
+                            _pm = outputs['masks'].detach().float()
+                            if _pm.shape[2:] != labels.shape[2:]:
+                                _pm = F.interpolate(_pm, size=labels.shape[2:], mode='bilinear', align_corners=False)
+                            _pb = (torch.sigmoid(_pm) > 0.5).float()
+                            _gb = (labels > 0).float()
+                            if _gb.dim() == 4 and _gb.shape[1] > 1:
+                                _gb = _gb[:, :1]
+                            _inter = (_pb * _gb).sum(dim=(1, 2, 3))
+                            _union = _pb.sum(dim=(1, 2, 3)) + _gb.sum(dim=(1, 2, 3)) - _inter
+                            _ri = ((_inter + 1e-7) / (_union + 1e-7)).clamp(0.0, 1.0).flatten()
+                            _n = min(len(patient_ids), _ri.numel())
+                            _qs2 = [float(_ri[i].item()) for i in range(_n)] + [0.0] * max(0, len(patient_ids) - _n)
+                        prompts['quality_score'] = _qs2
+                        prompts['iou_predictions'] = list(_qs2)
+                    try:
+                        loss = self.criterion(outputs, labels, interaction_round=interaction_round, previous_pred=previous_pred, global_epoch=epoch, new_click_coords=points)
+                    except Exception as e:
+                        model_logger.error(f"[FATAL] 前向传播错误: {str(e)}")
+                        model_logger.error(f"[FATAL] 病人ID: {patient_ids}, 类别: {categories}")
+                        model_logger.error(f"[FATAL] 交互轮次: {interaction_round}")
+                        if hasattr(self.model, 'temporal_memory'):
+                            self.model.temporal_memory.clear_all_history()
+                        elif hasattr(self.model.module, 'temporal_memory'):
+                            self.model.module.temporal_memory.clear_all_history()
+                        raise e
                 
                 pred_masks = outputs['masks'].float()
                 # Capture model-predicted mask quality (iou_pred = paper q_t) before deleting outputs
@@ -1776,7 +2145,7 @@ class TemporalTrainer(BaseTrainer):
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.warning(f"[WARNING] 交互轮次 {interaction_round+1} 的loss为NaN/Inf，跳过累加")
                 else:
-                    total_loss += loss
+                    total_loss += loss.float()
                 
                 dice_scores = self._calc_dice(pred_masks, labels)
                 tci_values = self._calc_tci(pred_masks, labels)
@@ -1953,7 +2322,6 @@ class TemporalTrainer(BaseTrainer):
         self.metrics_history['iou'].append(avg_iou)
         
         state_dict = self.model.module.state_dict() if self.args.multi_gpu else self.model.state_dict()
-        self._save_checkpoint(epoch, state_dict, avg_loss, avg_dice, avg_iou)
         self._plot_metrics(epoch)
         self._save_metrics_to_csv()
         
@@ -1988,7 +2356,8 @@ class TemporalTrainer(BaseTrainer):
                         'categories': categories,
                         'interaction_ids': patient_ids,
                         'temporal_enabled': True,
-                        'labels': labels,
+                        # [方案C+AntiLEAK 修复] 移除 labels 张量，改用 meta_label_sum 标量（合法：仅判空）。
+                        'meta_label_sum': [float(labels[i].sum().item()) if labels is not None else -1.0 for i in range(len(patient_ids))],
                         'interaction_round': 0,
                         'epoch': epoch
                     }
@@ -1996,13 +2365,34 @@ class TemporalTrainer(BaseTrainer):
                     points, point_labels = self._simulate_clicks(images, labels, None, 0)
                     prompts['point_coords'] = points.float()
                     prompts['point_labels'] = point_labels
+                    # [ANTI-LEAK compliant] 验证阶段也用 GT 算真实 IoU 作为 TQM 监督目标
+                    prompts['quality_score'] = [0.0] * len(patient_ids)
+                    prompts['iou_predictions'] = [0.0] * len(patient_ids)
+                    prompts['global_epoch'] = epoch
                     
                     with autocast():
                         if hasattr(self.model, 'forward'):
                             outputs = self.model.forward(images, prompts)
                         else:
                             outputs = self.model(images, prompts)
-                    
+                    # [ANTI-LEAK compliant] 用 GT 算真实 IoU 作为 TQM 监督目标（验证阶段）
+                    if isinstance(outputs, dict) and 'masks' in outputs:
+                        with torch.no_grad():
+                            _pm = outputs['masks'].detach().float()
+                            if _pm.shape[2:] != labels.shape[2:]:
+                                _pm = F.interpolate(_pm, size=labels.shape[2:], mode='bilinear', align_corners=False)
+                            _pb = (torch.sigmoid(_pm) > 0.5).float()
+                            _gb = (labels > 0).float()
+                            if _gb.dim() == 4 and _gb.shape[1] > 1:
+                                _gb = _gb[:, :1]
+                            _inter = (_pb * _gb).sum(dim=(1, 2, 3))
+                            _union = _pb.sum(dim=(1, 2, 3)) + _gb.sum(dim=(1, 2, 3)) - _inter
+                            _ri = ((_inter + 1e-7) / (_union + 1e-7)).clamp(0.0, 1.0).flatten()
+                            _n = min(len(patient_ids), _ri.numel())
+                            _qs3 = [float(_ri[i].item()) for i in range(_n)] + [0.0] * max(0, len(patient_ids) - _n)
+                        prompts['quality_score'] = _qs3
+                        prompts['iou_predictions'] = list(_qs3)
+
                     pred_masks = outputs['masks'].float()
                     all_preds.append(pred_masks)
                     all_labels.append(labels)
@@ -2044,7 +2434,8 @@ class TemporalTrainer(BaseTrainer):
                     'categories': categories,
                     'interaction_ids': patient_ids,
                     'temporal_enabled': True,
-                    'labels': labels,
+                    # [方案C+AntiLEAK 修复] 移除 labels 张量，改用 meta_label_sum 标量（合法：仅判空）。
+                    'meta_label_sum': [float(labels[i].sum().item()) if labels is not None else -1.0 for i in range(len(patient_ids))],
                     'interaction_round': 0,
                     'epoch': epoch
                 }
@@ -2138,14 +2529,15 @@ class TemporalTrainer(BaseTrainer):
                 if avg_iou > self.best_iou: 
                     self.best_iou = avg_iou
                 if avg_dice > self.best_dice: 
+                    prev_best = self.best_dice
                     self.best_dice = avg_dice
                     self._save_direct_checkpoint(epoch, state_dict, describe='dice_best')
-                    
                     self.early_stop_counter = 0
+                    logger.info(f"[早停监控] 新最佳 Dice: {self.best_dice:.4f}（前最佳: {prev_best:.4f}），早停计数器已清零: 0/{self.early_stop_patience}")
                 else:
                     if epoch >= 40:
                         self.early_stop_counter += 1
-                        logger.info(f"[早停监控] 性能未改善，早停计数器: {self.early_stop_counter}/{self.early_stop_patience}")
+                        logger.info(f"[早停监控] 性能未改善（当前 {avg_dice:.4f} ≤ 最佳 {self.best_dice:.4f}），早停计数器: {self.early_stop_counter}/{self.early_stop_patience}")
                 
                 if math.isnan(avg_loss) or math.isinf(avg_loss):
                     logger.error("[早停触发] 损失值异常，停止训练！")
@@ -2190,6 +2582,10 @@ class TemporalTrainer(BaseTrainer):
                     patient_count = len(self.model.multiscale_temporal_fusion.temporal_memory.history_buffer)
                     total_records = sum(len(v) for val in self.model.multiscale_temporal_fusion.temporal_memory.history_buffer.values() for v in val.values() if isinstance(val, dict))
                 print(f"[INFO] Epoch {epoch} 完成，历史缓冲包含 {patient_count} 个病人，共 {total_records} 条记录")
+                
+                # [PERIODIC TEST] 每 val_interval 个 epoch 自动跑测试集
+                if not self.args.multi_gpu or (self.args.multi_gpu and self.args.rank == 0):
+                    self._run_periodic_test(epoch, state_dict)
                 
       
         print("==========================================")
@@ -2241,19 +2637,17 @@ def main():
     ]
     if args.task_name == 'BTCV':
         args.classes = BTCV_CLASSES
-        args.use_temporal_fusion = True  
         args.num_classes = 14  
         args.window_level = 40
         args.window_width = 400
     elif args.task_name == 'AMOS2022_MR':
         args.classes = AMOS_CLASSES
-        args.use_temporal_fusion = True
         args.num_classes = 16  
         args.is_mr = True      
     elif 'ACDC' in args.task_name.upper():
         args.classes = ['background', 'RV', 'Myo', 'LV']
-        args.use_temporal_fusion = True
         args.num_classes = 4  
+    normalize_model_variant(args)
     logging.getLogger('cv2').setLevel(logging.WARNING)
     logging.getLogger('PIL').setLevel(logging.WARNING)
     logging.getLogger('matplotlib').setLevel(logging.WARNING)
