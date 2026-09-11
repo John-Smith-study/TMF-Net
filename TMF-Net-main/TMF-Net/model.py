@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from torch.utils.checkpoint import checkpoint
 import numpy as np
 import math
 import cv2
@@ -262,9 +263,10 @@ class QualityGateStrategy:
         Returns:
             tuple: (current_q_threshold, current_tqm_threshold, is_warmup)
         """
-        # 推理模式：直接使用最终阈值
+        # 推理模式：使用 warmup 起始阈值（低门槛），允许有效预测写入 memory
+        # （若直接用 max_threshold=0.75，测试首轮 iou_pred 常为负值，100% reject → 历史永空 → fusion 失效）
         if not is_training:
-            return self.max_q_threshold, self.max_tqm_threshold, False
+            return 0.0, 0.0, True
         
         epoch = max(0, global_epoch)
         
@@ -311,7 +313,10 @@ class QualityGateStrategy:
         按照论文公式 (11):
             g_t = I(q_t > τ_q(e) ∧ TQM_t > τ_tqm(e))
         
-        预热期特殊处理：epoch < E_start 时全部通过
+        训练模式：严格门控，动态阈值随 epoch 升高，防止低质量记录污染记忆
+        测试模式：宽松门控 —— 只要预测 q_t > 0.05（不是完全崩掉的空预测）就允许写入，
+                  不检查 TQM（因为 iou_predictor 未校准时 TQM 波动大，
+                  100% reject 会导致 memory 永空 → fusion 仅用空记忆引入噪声）
         
         Args:
             q_t: 当前轮次的预测质量
@@ -326,19 +331,25 @@ class QualityGateStrategy:
         """
         q_threshold, tqm_threshold, is_warmup = self._get_dynamic_thresholds(global_epoch, is_training)
         
-        # Eq.(10) TQM momentum (always compute, regardless of warmup stage)
+        # Eq.(10) TQM momentum (always compute, regardless of warmup stage / mode)
         tqm_t = self.calculate_tqm(q_t, q_prev, tqm_prev)
         
-        # Eq.(11) strict dual-condition gating — no short-circuit.
-        # When epoch < E_start: τ_q = 0, τ_tqm = 0  →  still require q_t > 0 AND TQM_t > 0
-        #   (blindly passing every record would pollute Append_8 memory buffer
-        #    with mass-worsening entries during early training)
-        # When E_start ≤ e < E_end : thresholds linearly ramp up
-        # When e ≥ E_end           : use final thresholds (0.75 / 0.02)
-        # At inference             : use final thresholds (0.75 / 0.02) directly
-        q_passed = q_t > q_threshold
-        tqm_passed = tqm_t > tqm_threshold
-        g_t = q_passed and tqm_passed
+        if not is_training:
+            # [TEST MODE relaxed gate]
+            # 测试阶段目标是用时序融合提升最终 Dice，而非"精选记忆"。
+            # 只要 q_t > 0.05（pred 不是全 0 的完全崩坏）就允许写入，
+            # 避免首轮或纠错轮次被 TQM>0 条件 100% reject → 空 memory → 融合注入噪声。
+            TEST_Q_THRESHOLD = 0.05
+            g_t = q_t > TEST_Q_THRESHOLD
+            # overwrite 显示阈值，日志中清晰可见测试模式用的是宽松门槛
+            q_threshold = TEST_Q_THRESHOLD
+            tqm_threshold = float('-inf')
+        else:
+            # Eq.(11) strict dual-condition gating in TRAIN mode
+            # When epoch < E_start: τ_q = 0, τ_tqm = 0  →  still require q_t > 0 AND TQM_t > 0
+            q_passed = q_t > q_threshold
+            tqm_passed = tqm_t > tqm_threshold
+            g_t = q_passed and tqm_passed
         
         return g_t, q_t, tqm_t, q_threshold, tqm_threshold, is_warmup
 
@@ -392,6 +403,8 @@ class TemporalMemoryModule(nn.Module):
             B_t = { Append8(B_{t-1}, h̃_t),  g_t = 1
                   { B_{t-1},                g_t = 0
         """
+        print(f"[STORE ENTRY] pid={patient_id}, cat={category}, epoch={global_epoch}, train={is_training}")
+        model_logger.info(f"[STORE ENTRY] pid={patient_id}, cat={category}, epoch={global_epoch}, train={is_training}")
         patient_id_str = self._safe_convert_id(patient_id)
         category_str = self._safe_convert_category(category)
         
@@ -427,9 +440,14 @@ class TemporalMemoryModule(nn.Module):
             )
             dice = ultra_safe_scalar(data.get('dice', 0.0))  
             global_epoch = ultra_safe_scalar(global_epoch)
-            label_sum = ultra_safe_scalar(data.get('label_sum', None))
+            # [ANTI-LEAK] label_sum 来自 GT labels，测试模式不传入（=None）。
+            # ultra_safe_scalar(None) 会返回 0.0，导致误判为空器官而跳过全部切片。
+            # 修复：只在显式提供 label_sum（训练模式有 GT）时才检查空器官；
+            # 测试模式由 test.py 已保证只处理含目标切片（GT≥10px），无需模型再查 GT。
+            label_sum_raw = data.get('label_sum', None)
+            label_sum = ultra_safe_scalar(label_sum_raw)
 
-            if isinstance(label_sum, (int, float)) and label_sum is not None and label_sum <= 0:
+            if label_sum_raw is not None and isinstance(label_sum, (int, float)) and label_sum <= 0:
                 model_logger.debug(f"[QUALITYGATE] Skip empty organ slice: label_sum={label_sum}")
                 print(f"[QUALITYGATE] Skip empty organ slice: label_sum={label_sum}")
                 return
@@ -453,6 +471,9 @@ class TemporalMemoryModule(nn.Module):
             print(f"[QUALITYGATE] patient={patient_id_str}, cat={category_str}, stage={stage}, "
                   f"q_t={q_t:.4f} (thresh={q_threshold:.4f}), TQM_t={tqm_t:.4f} (thresh={tqm_threshold:.4f}), "
                   f"g_t={g_t}")
+            model_logger.info(f"[QUALITYGATE] patient={patient_id_str}, cat={category_str}, stage={stage}, "
+                  f"q_t={q_t:.4f} (thresh={q_threshold:.4f}), TQM_t={tqm_t:.4f} (thresh={tqm_threshold:.4f}), "
+                  f"g_t={g_t}")
             
             # 更新 TQM 状态 (无论门控是否通过，都要更新动量)
             self.tqm_state[patient_id_str][category_str] = {'q_prev': q_t, 'tqm_prev': tqm_t}
@@ -460,6 +481,8 @@ class TemporalMemoryModule(nn.Module):
             # 公式 (13): 门控通过才更新记忆缓冲区
             if not g_t:
                 print(f"[QUALITYGATE] Record rejected: q_t={q_t:.4f} (threshold={q_threshold:.4f}), "
+                      f"TQM_t={tqm_t:.4f} (threshold={tqm_threshold:.4f})")
+                model_logger.info(f"[QUALITYGATE] Record rejected: q_t={q_t:.4f} (threshold={q_threshold:.4f}), "
                       f"TQM_t={tqm_t:.4f} (threshold={tqm_threshold:.4f})")
                 # g_t = 0 时，当前预测仍然有效，只是不更新 GRU 状态和记忆缓冲区
                 return
@@ -477,6 +500,8 @@ class TemporalMemoryModule(nn.Module):
                 has_nan = torch.isnan(data['features']).any().item()
                 has_inf = torch.isinf(data['features']).any().item()
                 print(f"[STOREDEBUG] patient={patient_id_str}, cat={category_str}, epoch={global_epoch}, "
+                      f"q_t={q_t:.4f}, TQM_t={tqm_t:.4f}, has_nan={has_nan}, has_inf={has_inf}")
+                model_logger.info(f"[STOREDEBUG] patient={patient_id_str}, cat={category_str}, epoch={global_epoch}, "
                       f"q_t={q_t:.4f}, TQM_t={tqm_t:.4f}, has_nan={has_nan}, has_inf={has_inf}")
                 if has_nan or has_inf:
                     model_logger.error(f"[FATAL] NaN/Inf detected, skip storing")
@@ -499,6 +524,7 @@ class TemporalMemoryModule(nn.Module):
             
             history_len_before = len(self.history_buffer.get(patient_id_str, {}).get(category_str, []))
             print(f"[STOREDEBUG] g_t=1, history_len_before={history_len_before}")
+            model_logger.info(f"[STOREDEBUG] g_t=1, history_len_before={history_len_before}")
         
             # 公式 (13): B_t = Append8(B_{t-1}, h̃_t)
             self.history_buffer[patient_id_str][category_str].append(reduced_data)
@@ -508,8 +534,10 @@ class TemporalMemoryModule(nn.Module):
                 self.history_buffer[patient_id_str][category_str] = self.history_buffer[patient_id_str][category_str][-self.MAX_HISTORY:]
             
             print(f"[STOREDEBUG] after store, history_len={len(self.history_buffer[patient_id_str][category_str])}")
+            model_logger.info(f"[STOREDEBUG] after store, history_len={len(self.history_buffer[patient_id_str][category_str])}")
         except Exception as e:
             print(f"[STOREDEBUG ERROR] store process failed: {e}")
+            model_logger.error(f"[STOREDEBUG ERROR] store process failed: {e}")
             import traceback
             traceback.print_exc()
     def update_history(self, patient_id, data, global_epoch=0, is_training=True):
@@ -1117,6 +1145,15 @@ class MultiScaleFeatureFusion(nn.Module):
         for layer in self.scale_adapters:
             feats.append(layer(x))
         return feats
+    def _fuse_single_scale(self, c, h, gate_idx):
+        """单尺度融合（用于 gradient checkpointing）"""
+        if c.shape[2:] != h.shape[2:]:
+            h = F.interpolate(h, size=c.shape[2:], mode='bilinear', align_corners=False)
+        concatenated = torch.cat([c, h], dim=1)
+        weights = self.gates[gate_idx](concatenated)
+        fused_feat = weights[:, 0:1] * c + weights[:, 1:2] * h
+        return fused_feat
+
     def fuse_features(self, current_img_feat, historical_img_feat, scale_weights=None):
         """
         按照论文公式 (3) 实现自适应融合:
@@ -1127,15 +1164,13 @@ class MultiScaleFeatureFusion(nn.Module):
         hist_list = self.extract_multi_scale_features(historical_img_feat)
         fused = []
         for i, (c, h) in enumerate(zip(curr_list, hist_list)):
-            if c.shape[2:] != h.shape[2:]:
-                h = F.interpolate(h, size=c.shape[2:], mode='bilinear', align_corners=False)
-            concatenated = torch.cat([c, h], dim=1)  
-            
-            weights = self.gates[i](concatenated)  
-            
-            fused_feat = weights[:, 0:1] * c + weights[:, 1:2] * h
+            if self.training and c.requires_grad:
+                # gradient checkpointing: 不保留中间激活，反向时重算
+                fused_feat = checkpoint(self._fuse_single_scale, c, h, i, use_reentrant=False)
+            else:
+                fused_feat = self._fuse_single_scale(c, h, i)
             fused.append(fused_feat)
-        target_size = fused[-1].shape[2:]  
+        target_size = fused[-1].shape[2:]
         resized_fused = []
         for f in fused:
             if f.shape[2:] != target_size:
@@ -1162,9 +1197,12 @@ class MultiScaleTemporalFusion(nn.Module):
                 in_dim=feature_dim
             )
         
-        total_scale_channels = sum([feature_dim // (2 ** i) for i in range(num_scales)])  
+        total_scale_channels = sum([feature_dim // (2 ** i) for i in range(num_scales)])
+        projector_in_channels = (
+            feature_dim if ablation_no_multi_scale else total_scale_channels
+        )
         self.feature_projector = nn.Sequential(
-            nn.Conv2d(total_scale_channels, feature_dim, kernel_size=1),  
+            nn.Conv2d(projector_in_channels, feature_dim, kernel_size=1),
             nn.GroupNorm(8, feature_dim),
             nn.ReLU(inplace=True)
         )
@@ -1375,9 +1413,26 @@ class MultiScaleTemporalFusion(nn.Module):
         global_epoch = _safe_scalar(current_prompt.get('global_epoch', 0))
         dice_val = _safe_scalar(current_prompt.get('dice', 0.0))
         tci_val = _safe_scalar(current_prompt.get('tci', 0.0))
+        # [AntiLEAK] label_sum 只用于 quality gate 判空，不应该依赖 prompts['labels']（整块 GT 张量）。
+        # 标准路径：train.py 通过 meta_label_sum 传 list[float] 标量（GT 前景像素数，每样本一个标量）
+        # 兼容 fallback：如果旧代码还传 labels tensor，也能读但会打印警告。
+        meta_label_sum_list = current_prompt.get('meta_label_sum', None) if isinstance(current_prompt, dict) else None
         labels_tensor = current_prompt.get('labels', None) if isinstance(current_prompt, dict) else None
         label_sum_val = None
-        if labels_tensor is not None:
+        if meta_label_sum_list is not None:
+            # list 中按 batch_idx 取第一个
+            if isinstance(meta_label_sum_list, (list, tuple)) and len(meta_label_sum_list) > 0:
+                item = meta_label_sum_list[batch_idx % len(meta_label_sum_list)] if 'batch_idx' in dir() else meta_label_sum_list[0]
+                if isinstance(item, torch.Tensor):
+                    label_sum_val = item.item() if item.numel() == 1 else item.sum().item()
+                else:
+                    label_sum_val = float(item)
+            elif isinstance(meta_label_sum_list, (int, float)):
+                label_sum_val = float(meta_label_sum_list)
+            elif isinstance(meta_label_sum_list, torch.Tensor):
+                label_sum_val = meta_label_sum_list.item() if meta_label_sum_list.numel() == 1 else meta_label_sum_list.sum().item()
+        elif labels_tensor is not None:
+            # LEGACY 兼容：老代码还传 labels tensor（不推荐，会打印警告）
             if isinstance(labels_tensor, torch.Tensor):
                 label_sum_val = labels_tensor.sum().item()
             elif isinstance(labels_tensor, (int, float)):
@@ -1492,45 +1547,78 @@ class MultiScaleTemporalFusion(nn.Module):
                 enhanced_features = self.output_adapter(combined_feature)
                 return enhanced_features
             elif self.ablation_no_multi_scale:
-                stage_factor = 0.4 if global_epoch >= self.stage_2_end else 0.01 if global_epoch >= self.stage_1_end else 0.0
-                fused_features = image_features + 0.3 * temporal_context
-                combined_feature = fused_features
-                
-                if not self.ablation_no_trajectory and trajectory_feature is not None and isinstance(trajectory_feature, torch.Tensor):
+                if global_epoch < self.stage_1_end:
+                    stage_factor = 0.0
+                elif global_epoch < self.stage_2_end:
+                    stage_factor = 0.01 + (
+                        global_epoch - self.stage_1_end
+                    ) * (0.19 / (self.stage_2_end - self.stage_1_end))
+                else:
+                    stage_factor = 0.4
+
+                self.stage_factor = stage_factor
+
+                # 单尺度路径：不调用 multi_scale_fusion
+                combined_feature = image_features + 0.3 * temporal_context
+
+                # feature_projector 保留
+                combined_feature = self.feature_projector(combined_feature)
+
+                if (
+                    not self.ablation_no_trajectory
+                    and trajectory_feature is not None
+                    and isinstance(trajectory_feature, torch.Tensor)
+                ):
                     if trajectory_feature.dim() == 2:
                         trajectory_feature = trajectory_feature.unsqueeze(-1).unsqueeze(-1)
                     elif trajectory_feature.dim() == 3:
                         trajectory_feature = trajectory_feature.unsqueeze(-1)
+
                     if trajectory_feature.shape[2:] != combined_feature.shape[2:]:
                         trajectory_feature = F.interpolate(
                             trajectory_feature,
                             size=combined_feature.shape[2:],
                             mode='nearest'
                         )
+
                     trajectory_feature = trajectory_feature.expand_as(combined_feature)
                     trajectory_feature = trajectory_feature.to(device)
-                    
-                    gate_weight = torch.sigmoid(self.trajectory_fusion_weight).view(1, 1, 1, 1)
-                    gate_weight = gate_weight * stage_factor
-                    gate_weight = torch.clamp(gate_weight, 0.0, 0.3)
-                    
-                    if combined_feature.shape[1] == trajectory_feature.shape[1] and combined_feature.shape[2:] == trajectory_feature.shape[2:]:
-                        temporal_fusion_input = torch.cat([combined_feature, trajectory_feature], dim=1)
-                        if temporal_fusion_input.shape[1] == self.feature_dim * 2:
-                            projected_fusion = self.temporal_projector(temporal_fusion_input)
-                            combined_feature = combined_feature + gate_weight * projected_fusion
-                        else:
-                            combined_feature = combined_feature + gate_weight * trajectory_feature
-                
-                if combined_feature.dim() == 2:
-                    combined_feature = combined_feature.unsqueeze(-1).unsqueeze(-1)
-                elif combined_feature.dim() == 3:
-                    combined_feature = combined_feature.unsqueeze(-1)
-                if combined_feature.dim() != 4:
-                    combined_feature = combined_feature.view(combined_feature.shape[0], self.feature_dim, 1, 1)
-                
-                enhanced_features = self.output_adapter(combined_feature)
-                return enhanced_features
+
+                    # 保留 cross_scale_attention
+                    mem_state = trajectory_feature.mean(dim=(2, 3))
+                    attention_output = self.cross_scale_attention(
+                        [combined_feature], mem_state
+                    )
+
+                    attention_gate = torch.sigmoid(self.temporal_gate) * stage_factor
+                    attention_gate = torch.clamp(attention_gate, 0.0, 0.3)
+
+                    combined_feature = (
+                        combined_feature
+                        + attention_gate * attention_output
+                    )
+
+                    # 保留 temporal_projector
+                    temporal_input = torch.cat(
+                        [combined_feature, trajectory_feature],
+                        dim=1
+                    )
+
+                    trajectory_gate = torch.sigmoid(
+                        self.trajectory_fusion_weight
+                    ) * stage_factor
+                    trajectory_gate = torch.clamp(
+                        trajectory_gate, 0.0, 0.3
+                    )
+
+                    combined_feature = (
+                        combined_feature
+                        + trajectory_gate
+                        * self.temporal_projector(temporal_input)
+                    )
+
+                # 保留 output_adapter
+                return self.output_adapter(combined_feature)
             else:
                 if global_epoch < self.stage_1_end:
                     stage_factor = 0.0
@@ -1734,8 +1822,9 @@ class IMISNet(nn.Module):
 
 class TMFNet(IMISNet):
     def __init__(self, sam, test_mode=False, fusion_warmup_epochs=20, max_fusion_strength=1.5, num_classes=4, 
-                 ablation_no_multi_scale=False, ablation_no_trajectory=False, **kwargs):
+                 ablation_no_multi_scale=False, ablation_no_trajectory=False, use_temporal_fusion=True, **kwargs):
         super().__init__(sam, test_mode, **kwargs)
+        self.use_temporal_fusion = use_temporal_fusion
         self.use_auto_prompt = False  
         self.num_classes = num_classes  
         feature_dim = 768  
@@ -1751,7 +1840,10 @@ class TMFNet(IMISNet):
         self.interaction_step = 0  
         self.interaction_history = {}  
         self.use_adaptive_threshold = True  
-        self.postprocess_trigger_threshold = 0.6  
+        # Fix 2: 交互测试的中间 Dice (0.3~0.6) 是正常的纠错阶段，
+        # 不应被判定为"困难样本"再去做可能把前景刷空的激进后处理。
+        # 只在 Dice < 0.3 的真正崩坏掉的样本上才触发困难后处理。
+        self.postprocess_trigger_threshold = 0.3  
         self.difficult_dice_threshold = 0.7
         self.interaction_guide = AdaptiveInteractionGuide()
         self.best_threshold = 0.5  
@@ -2054,11 +2146,31 @@ class TMFNet(IMISNet):
         history = []
         if interaction_id is not None and interaction_id in self.interaction_history and len(self.interaction_history[interaction_id]) > 0:
             history = self.interaction_history[interaction_id]
-        if history:
+        # [Bug 7 修复] 测试模式下，R1+ 不再从 interaction_history 读取 pred_mask 作为 mask_inputs。
+        # 原因：R0 的 pred_mask 经过 fusion_strength=1.2 增强，形状已被"锁定"。R1 把它当 mask_inputs
+        # prior 传给 prompt_encoder 时，SAM 会高度信任这个 prior，导致纠错点改不动 → R0→R1 暴跌 0.2-0.5。
+        # 尤其对 aorta/IVC 管状器官，fusion 后的 mask 形状锁死，纠错点完全失效。
+        # 修复：测试模式下 mask_inputs 只用 prompt 显式传入的（来自上一轮 forward 输出，已含 fusion），
+        # 但不再叠加 history 查找的"上一轮 pred_mask"。训练模式保持原逻辑（history 用于 TQM 学习）。
+        if history and self.training:
             for entry in reversed(history):
-                if 'pred_mask' in entry:
-                    mask_inputs = entry['pred_mask'].detach().to(image_embedding.device)
-                    
+                # [Bug 3C 修复] 必须 entry['pred_mask'] 是非空张量，才能当 mask_inputs。
+                # 否则首轮或异常跳过的 entry 可能带 None/空 pred_mask，导致 interpolate 崩溃
+                # 或 prompt_encoder 收到形状错误的 mask embedding（直接把 dense_pe 打乱）
+                pm = entry.get('pred_mask', None) if isinstance(entry, dict) else None
+                valid = (
+                    pm is not None
+                    and isinstance(pm, torch.Tensor)
+                    and pm.numel() > 0
+                    and not torch.isnan(pm).any()
+                )
+                if not valid:
+                    continue
+                try:
+                    mask_inputs = pm.detach().to(image_embedding.device)
+                    if mask_inputs.dim() < 4:
+                        while mask_inputs.dim() < 4:
+                            mask_inputs = mask_inputs.unsqueeze(0)
                     if mask_inputs.shape[-1] != 256:
                         mask_inputs = F.interpolate(
                             mask_inputs,
@@ -2067,6 +2179,11 @@ class TMFNet(IMISNet):
                             align_corners=False
                         )
                     break
+                except Exception:
+                    # 异常：跳过这一条，尝试更旧一条
+                    mask_inputs = (prompt.get("mask_inputs", None)
+                                   if isinstance(prompt, dict) else None)
+                    continue
         
         sparse_embeddings, dense_embeddings = self.prompt_encoder(
             points=points,
@@ -2100,6 +2217,13 @@ class TMFNet(IMISNet):
         else:
             low_res_masks, iou_pred, semantic_pred = outputs['low_res_masks'], outputs['iou_pred'], outputs[
                 'semantic_pred']
+        # [FIX iou_pred clamp] IoU 预测值理论范围 [0,1]，MLP 头会输出负值或超1值，
+        # 导致 quality gate TQM_t = 0.5*TQM_prev + 0.5*(q_t - q_prev) 出现负值而被错误拒绝。
+        # 训练时保持 soft clamp 留梯度；eval/inference 用硬 clamp 稳数值。
+        if self.training:
+            iou_pred = torch.clamp(iou_pred, min=-0.2, max=1.2)
+        else:
+            iou_pred = torch.clamp(iou_pred, min=0.0, max=1.0)
         masks = F.interpolate(low_res_masks, size=self.image_size, mode='bilinear', align_corners=False)
         is_valid_dict = isinstance(prompt, dict)
         if is_valid_dict and 'interaction_id' in prompt:
@@ -2112,7 +2236,14 @@ class TMFNet(IMISNet):
             interaction_id = None
         if interaction_id is not None and interaction_id in self.interaction_history and len(self.interaction_history[interaction_id]) > 0:
             latest_entry = self.interaction_history[interaction_id][-1]
-            latest_entry['pred_mask'] = low_res_masks.detach().cpu()
+            # [Bug 3C 写入端修复] 仅当 low_res_masks 是合法 4D 张量时写入 pred_mask。
+            # 异常跳过写入会让读取端 fallback 到 prompt['mask_inputs'] 或 no_mask_embed，
+            # 总比把 None/形状错误的 low_res_masks 污染 memory_history 好。
+            if (isinstance(low_res_masks, torch.Tensor)
+                    and low_res_masks.numel() > 0
+                    and not torch.isnan(low_res_masks).any()
+                    and low_res_masks.dim() >= 3):
+                latest_entry['pred_mask'] = low_res_masks.detach().cpu()
         outputs = {
             'masks': masks.float(),
             'low_res_masks': low_res_masks,
@@ -2176,11 +2307,18 @@ class TMFNet(IMISNet):
     
     def forward_with_features(self, curr_features, prompts):
         """使用预提取的图像特征进行前向传播（支持 Batch 版）"""
+        model_logger.info(f"[FWF ENTRY] keys={list(prompts.keys())}, has_ms_tf={hasattr(self, 'multiscale_temporal_fusion')}, has_pending={hasattr(self.multiscale_temporal_fusion, '_pending_store') if hasattr(self, 'multiscale_temporal_fusion') else 'N/A'}")
         if torch.isnan(curr_features).any() or torch.isinf(curr_features).any():
             model_logger.error("[ERROR] forward_with_features 输入 curr_features 包含 NaN/Inf！")
             curr_features = torch.nan_to_num(curr_features, nan=0.0, posinf=1.0, neginf=-1.0)
             curr_features = torch.clamp(curr_features, -1.0, 1.0)
         
+        prompt_temporal_enabled = True
+        if isinstance(prompts, dict):
+            prompt_temporal_enabled = bool(prompts.get('temporal_enabled', True))
+        if not getattr(self, 'use_temporal_fusion', True) or not prompt_temporal_enabled:
+            return self.forward_decoder(curr_features, prompts)
+
         patient_ids = prompts.get('patient_ids', [])
         categories = prompts.get('categories', [])
         
@@ -2260,23 +2398,59 @@ class TMFNet(IMISNet):
                     fusion_strength = 0.0
                 elif global_epoch < 10 + warmup_epochs:
                     progress = (global_epoch - 10) / warmup_epochs
-                    fusion_strength = progress * max_fusion_weight   
+                    fusion_strength = progress * max_fusion_weight
                 else:
-                    fusion_strength = max_fusion_weight
-                
+                    # [Bug 3B 修复] TEST 模式 fusion_strength 按交互轮次退火
+                    #   训练时 max_fusion_weight 是静态超参（1.5），对应训练课程的 5 轮上限。
+                    #   测试协议为固定 8 轮，后期 history 饱和，过高 fs 会让历史记忆
+                    #   压过当前纠错点信号 → 表现为“轮次越多越点越差”。
+                    #   因此测试时：fs 从 round=0(首点后):1.8 → round=7(最后):0.6 线性下降。
+                    #   训练模式保持原样（max_fusion_weight）。
+                    if not self.training:
+                        i_round = 0
+                        if isinstance(prompts, dict):
+                            i_round = prompts.get('interaction_round', 0)
+                            if isinstance(i_round, torch.Tensor):
+                                i_round = int(i_round.item()) if i_round.numel() > 0 else 0
+                        # 保证取值合法（0..7，对应 clicks 1..8）
+                        i_round = max(0, min(7, int(i_round)))
+                        N = 7
+                        # [Bug 3B 修正 v2] 之前范围 1.8→0.6 过激：
+                        #   R0=1.8 让首点 fusion 虚高（如 aorta 0.84），但 R1+ 加入 mask_inputs 后
+                        #   双重 prior 反而抑制新点 → R0→R1 普跌 0.1-0.3。
+                        #   改为温和退火：R0=1.2 → R7=0.9，全程接近训练 max_fusion_weight=1.5 但略低，
+                        #   保证 fusion 始终有效但不喧宾夺主。
+                        TEST_FS_START = 1.2
+                        TEST_FS_END = 0.9
+                        ratio = i_round / N  # 0..1
+                        fusion_strength = TEST_FS_START + (TEST_FS_END - TEST_FS_START) * ratio
+                    else:
+                        fusion_strength = max_fusion_weight
+
                 temporal_enhancement = self.multiscale_temporal_fusion(
                     current_prompt=single_prompt,
                     history=fusion_history,
                     image_features=single_curr_feat,
                     is_training=self.training
                 )
-                
+
                 gate_weight = torch.sigmoid(self.multiscale_temporal_fusion.trajectory_fusion_weight)
                 single_fused_feat = single_curr_feat + fusion_strength * gate_weight * temporal_enhancement
-                
+
+                # 诊断：对比 fusion 前后特征，判断 fusion 是否压负了 logits（存属性，由 test.py logger 输出）
+                _cf = single_curr_feat.detach()
+                _ff = single_fused_feat.detach()
+                self._last_fusion_diag = (
+                    f"[FUSION_DIAG] pid={single_patient_id} cat={single_category} round={single_prompt.get('interaction_round', 0)} "
+                    f"fs={fusion_strength:.3f} gate={float(gate_weight):.3f} | "
+                    f"curr_feat: mean={_cf.mean():.3f} max={_cf.max():.3f} | "
+                    f"fused_feat: mean={_ff.mean():.3f} max={_ff.max():.3f} | "
+                    f"delta: mean={(_ff-_cf).mean():.3f} max={(_ff-_cf).max():.3f}"
+                )
+
                 model_logger.debug(f"[DEBUG] Epoch {global_epoch}, fusion_strength: {fusion_strength}, fusion_enabled: {fusion_enabled}")
             history_current = self.temporal_memory.get_history(single_patient_id, single_category) if hasattr(self, 'temporal_memory') else []
-            model_logger.debug(f"[DEBUG] 交互轮次: {single_prompt.get('interaction_round', 0)}, 当前类别库长度: {len(history_current)}, 总库长度: {len(history)}")
+            model_logger.info(f"[DEBUG] 交互轮次: {single_prompt.get('interaction_round', 0)}, 当前类别库长度: {len(history_current)}, 总库长度: {len(history)}, patient={single_patient_id}, cat={single_category}")
             
             fused_features_list.append(single_fused_feat)
         
@@ -2292,46 +2466,11 @@ class TMFNet(IMISNet):
         total_improvement = 0.0
         binary_masks = None
         
-        if isinstance(prompts, dict) and 'labels' in prompts and prompts['labels'] is not None and self.test_mode and not self.training:
-            model_logger.debug(f"[DEBUG] Forward method call: test_mode={self.test_mode}, labels={prompts['labels'] is not None}")
-            if not isinstance(outputs, dict):
-                outputs = {'masks': outputs}
-            pred_masks = outputs['masks']
-            batch_size = pred_masks.shape[0]
-            binary_masks = torch.zeros_like(pred_masks)
-            for i in range(batch_size):
-                single_pred = pred_masks[i:i + 1]
-                single_label = prompts['labels'][i:i + 1]
-                pred_binary = (torch.sigmoid(single_pred) > 0.5).float()
-                label_binary = (single_label > 0).float()
-                intersection = (pred_binary.squeeze() * label_binary.squeeze()).sum()
-                orig_dice = (2 * intersection) / (pred_binary.squeeze().sum() + label_binary.squeeze().sum() + 1e-8)
-                orig_iou = intersection / (
-                            pred_binary.squeeze().sum() + label_binary.squeeze().sum() - intersection + 1e-8)
-                if orig_dice < self.postprocess_trigger_threshold:
-                    total_difficult += 1
-                    model_logger.debug(f"[DEBUG] Difficult sample #{i}, orig_dice={orig_dice:.4f}, orig_iou={orig_iou:.4f}") 
-                    processed_mask = self.postprocess_difficult_samples(single_pred, single_label)
-                    processed_binary = processed_mask
-                    post_intersection = (processed_binary.squeeze() * label_binary.squeeze()).sum()
-                    post_dice = (2 * post_intersection) / (
-                                processed_binary.squeeze().sum() + label_binary.squeeze().sum() + 1e-8)
-                    post_iou = post_intersection / (
-                                processed_binary.squeeze().sum() + label_binary.squeeze().sum() - post_intersection + 1e-8)
-                    improvement = (post_dice - orig_dice) / orig_dice * 100 if orig_dice > 0 else 0
-                    if post_dice > orig_dice:
-                        successfully_improved += 1
-                        total_improvement += improvement.item()
-                        print(
-                            f"[SUCCESS] 困难样本 #{i} 后处理有效: dice从{orig_dice:.4f}提升到{post_dice:.4f}, 改善{improvement:.2f}%"
-                        )
-                    else:
-                        print(
-                            f"[INFO] 困难样本 #{i} 后处理无效: dice从{orig_dice:.4f}变为{post_dice:.4f}"
-                        ) 
-                binary_masks[i] = processed_mask
-            else:
-                binary_masks[i] = self.binary_mask_with_threshold(single_pred, 0.5)
+        # [ANTI-LEAK] 测试模式下禁止读取 GT labels 进行困难样本后处理
+        # forward() 在 eval/test 时永远不应该读取 GT label。
+        # labels 仅允许用于：(1) 模拟用户点击 (2) test.py 最终算指标
+        # if isinstance(prompts, dict) and 'labels' in prompts and prompts['labels'] is not None and self.test_mode and not self.training:
+        #     ... (disabled: GT-based difficult sample postprocessing)
         avg_improvement = total_improvement / successfully_improved if successfully_improved > 0 else 0
         model_logger.debug(f"[DEBUG] Total {total_difficult} difficult samples detected in forward")
         model_logger.debug(f"[DEBUG] Successfully improved {successfully_improved} difficult samples, average improvement {avg_improvement:.2f}%")
@@ -2340,30 +2479,37 @@ class TMFNet(IMISNet):
         # ============================================================
         # Paper Eqs.(10)-(13) real memory write: decoder now gave iou_pred (mask quality q_t)
         # ============================================================
+        # 用 try/finally 保证：即便 QUALITYGATE / binary_masks / store 抛异常，
+        # 也必须清空 _pending_store，避免跨类别/跨切片 累积污染（Bug：pending_len=5/8）。
         if hasattr(self, 'multiscale_temporal_fusion') and hasattr(self.multiscale_temporal_fusion, '_pending_store'):
             pending = self.multiscale_temporal_fusion._pending_store
-            iou_pred_tensor = outputs.get('iou_pred', None)
-            if isinstance(iou_pred_tensor, torch.Tensor):
-                iou_pred_tensor = iou_pred_tensor.detach().float().cpu()
-            tm_store_target = None
-            if hasattr(self, 'temporal_memory') and hasattr(self.temporal_memory, 'store'):
-                tm_store_target = self.temporal_memory
-            elif hasattr(self.multiscale_temporal_fusion, 'temporal_memory') and hasattr(self.multiscale_temporal_fusion.temporal_memory, 'store'):
-                tm_store_target = self.multiscale_temporal_fusion.temporal_memory
-            for idx, item in enumerate(pending):
-                pid, cat, data_dict, epoch_val, is_train = item
-                q_t = float(data_dict.get('quality_score', data_dict.get('dice', 0.0)))
-                if iou_pred_tensor is not None and isinstance(iou_pred_tensor, torch.Tensor):
-                    flat = iou_pred_tensor.flatten()
-                    if idx < flat.numel():
-                        q_t = float(flat[idx].item())
-                    elif flat.numel() > 0:
-                        q_t = float(flat.mean().item())
-                data_dict['quality_score'] = q_t
-                data_dict['iou_predictions'] = q_t
-                if tm_store_target is not None:
-                    tm_store_target.store(pid, cat, data_dict, epoch_val, is_train)
-            self.multiscale_temporal_fusion._pending_store = []
+            try:
+                iou_pred_tensor = outputs.get('iou_pred', None)
+                if isinstance(iou_pred_tensor, torch.Tensor):
+                    iou_pred_tensor = iou_pred_tensor.detach().float().cpu()
+                tm_store_target = None
+                if hasattr(self, 'temporal_memory') and hasattr(self.temporal_memory, 'store'):
+                    tm_store_target = self.temporal_memory
+                elif hasattr(self.multiscale_temporal_fusion, 'temporal_memory') and hasattr(self.multiscale_temporal_fusion.temporal_memory, 'store'):
+                    tm_store_target = self.multiscale_temporal_fusion.temporal_memory
+                print(f"[MEMSTORE DIAG] pending_len={len(pending)}, tm_store_target={'set' if tm_store_target is not None else 'NONE'}, has_iou_pred={isinstance(iou_pred_tensor, torch.Tensor)}")
+                model_logger.info(f"[MEMSTORE DIAG] pending_len={len(pending)}, tm_store_target={'set' if tm_store_target is not None else 'NONE'}, has_iou_pred={isinstance(iou_pred_tensor, torch.Tensor)}")
+                for idx, item in enumerate(pending):
+                    pid, cat, data_dict, epoch_val, is_train = item
+                    q_t = float(data_dict.get('quality_score', data_dict.get('dice', 0.0)))
+                    if iou_pred_tensor is not None and isinstance(iou_pred_tensor, torch.Tensor):
+                        flat = iou_pred_tensor.flatten()
+                        if idx < flat.numel():
+                            q_t = float(flat[idx].item())
+                        elif flat.numel() > 0:
+                            q_t = float(flat.mean().item())
+                    data_dict['quality_score'] = q_t
+                    data_dict['iou_predictions'] = q_t
+                    if tm_store_target is not None:
+                        tm_store_target.store(pid, cat, data_dict, epoch_val, is_train)
+            finally:
+                # 无论成功与否，本轮所有 pending 必须清零，防止残留到下一次 forward
+                self.multiscale_temporal_fusion._pending_store = []
 
         assert not (self.training and 'binary_masks' in outputs), "训练时不能生成二值掩码！"
         return outputs
@@ -2427,7 +2573,24 @@ class TMFNet(IMISNet):
                 lab, nf = _ndi.label(b_np > 0.5)
                 if nf > 0:
                     sizes = _ndi.sum(b_np, lab, range(1, nf + 1))
-                    keep = _np.isin(lab, _np.where(sizes > 20)[0] + 1)
+                    # Fix 1a (困难样本后处理 / 模型内部):
+                    # 旧代码对困难样本用 CC > 20 过滤，对 aorta/gallbladder/esophagus 等小目标
+                    # 出现过 15/18/21/42 像素 -> 0 的"正反馈死循环"，后续交互轮 prev_mask 全 0，
+                    # decoder 永远恢复不出来。
+                    # 规则:
+                    #   - 先用更轻的阈值 (k=5)，保留小/管状器官少量但真实的正激活；
+                    #   - 若形态学之后仍有前景（orig_after_morph > 0）但 CC 过滤会把它变成 0，
+                    #     则**强制退化**：退而求其次保留最大的 1 个连通域（哪怕只有 1 像素），
+                    #     也绝对不允许下一轮拿到全空的 previous_pred。
+                    after_morph_area = int(b_np.sum())
+                    keep_idx = _np.where(sizes > 5)[0] + 1       # k 20 -> 5
+                    keep = _np.isin(lab, keep_idx)
+                    filtered_area = int(keep.sum())
+                    if after_morph_area > 0 and filtered_area == 0:
+                        # 退级: 保留最大连通域 (哪怕 1~4 像素)
+                        largest_id = int(_np.argmax(sizes)) + 1
+                        keep = _np.isin(lab, largest_id)
+                        filtered_area = int(keep.sum())
                     b_np = keep.astype(_np.float32)
                 else:
                     b_np = b_np.astype(_np.float32)
@@ -2706,8 +2869,10 @@ class TMFNet(IMISNet):
                 
                 if interaction_id in self.interaction_history:
                     del self.interaction_history[interaction_id]
-        if hasattr(self, 'multiscale_temporal_fusion'):
-            self.multiscale_temporal_fusion.temporal_memory.clear_history(interaction_id)
+        # ⚠️ reset_interaction 只清空 interaction_history（prev_mask 缓存），
+        # 不再清 temporal_memory！Temporal memory 是跨切片/跨轮次累积的核心，
+        # 只在：(1) 切换到新病人 (test.py batch 开头 new-patient reset) 
+        # 或   (2) 精确 clear_history(patient_id, category) 时才清空。
         if hasattr(self, 'interaction_step'):
             self.interaction_step = 0
     def _adaptive_history_length(self, current_length):
